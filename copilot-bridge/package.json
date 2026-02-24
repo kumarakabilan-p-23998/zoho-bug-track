@@ -1,0 +1,32 @@
+{
+  "name": "copilot-bridge",
+  "displayName": "Copilot AI Bridge",
+  "description": "Bridges VS Code Copilot models (Claude Opus, GPT-4o, etc.) to a local HTTP endpoint for external tools like Zoho Bug Tracker",
+  "version": "1.0.0",
+  "publisher": "zoho-bug-tracker",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "copilotBridge.start",
+        "title": "Copilot Bridge: Start Server"
+      },
+      {
+        "command": "copilotBridge.stop",
+        "title": "Copilot Bridge: Stop Server"
+      },
+      {
+        "command": "copilotBridge.toggle",
+        "title": "Copilot Bridge: Toggle Server"
+      }
+    ]
+  },
+  "extensionDependencies": [
+    "github.copilot-chat"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "zoho-bug-track",
+  "version": "1.0.0",
+  "description": "Per-user Zoho Bug Tracker with code analysis. Login with Zoho, configure your project directory, analyze bugs and get AI fix prompts.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js --port 3000"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=8.0.0"
+  },
+  "keywords": ["zoho", "bug-tracker", "code-analysis", "ember"],
+  "private": true
+}

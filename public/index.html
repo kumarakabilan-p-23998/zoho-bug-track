@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bug Tracker – Zoho Projects</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- ═══ Login Screen ═══ -->
+  <div id="login-screen" class="screen">
+    <div class="login-wrapper">
+      <div class="login-card">
+        <div class="login-brand">
+          <svg class="login-icon" viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="#e8443a" stroke-width="1.5">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M8 9.5c0-1 .8-2 2-2s2 1 2 2-.8 1.5-2 2.5c-1 .8-2 1.5-2 2.5m4 0c0 1-.8 2-2 2s-2-1-2-2 .8-1.5 2-2.5c1-.8 2-1.5 2-2.5"/>
+          </svg>
+          <h1>Bug Tracker</h1>
+        </div>
+        <p class="login-subtitle">Sign in to manage and track bugs from Zoho Projects</p>
+        <a href="/auth/login" class="login-btn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          Sign in with Zoho
+        </a>
+        <div id="login-error" class="login-error" style="display:none;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Main App ═══ -->
+  <div id="app-screen" class="screen" style="display:none;">
+    <!-- Header -->
+    <header class="zp-header">
+      <div class="zp-header-left">
+        <svg class="zp-header-icon" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#fff" stroke-width="1.5">
+          <circle cx="12" cy="12" r="10"/>
+          <path d="M8 9.5c0-1 .8-2 2-2s2 1 2 2-.8 1.5-2 2.5c-1 .8-2 1.5-2 2.5m4 0c0 1-.8 2-2 2s-2-1-2-2 .8-1.5 2-2.5c1-.8 2-1.5 2-2.5"/>
+        </svg>
+        <span class="zp-header-title">Bug Tracker</span>
+        <span class="zp-header-sep">|</span>
+        <span class="zp-header-project" id="header-project">Zoho Projects</span>
+      </div>
+      <nav class="zp-header-nav">
+        <button class="zp-header-tab active" data-tab="bugs">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          Bugs
+        </button>
+        <button class="zp-header-tab" data-tab="search">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          Code Search
+        </button>
+        <button class="zp-header-tab" data-tab="settings">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          Settings
+        </button>
+      </nav>
+      <div class="zp-header-right">
+        <div class="zp-header-user">
+          <span class="zp-avatar" id="user-avatar"></span>
+          <span id="user-name"></span>
+        </div>
+        <button id="logout-btn" class="zp-header-logout" title="Sign out">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="zp-body">
+      <!-- Main Content Area -->
+      <main class="zp-main">
+
+        <!-- ═══ Bugs Tab ═══ -->
+        <div id="tab-bugs" class="tab-content active">
+          <!-- Content Header -->
+          <div class="content-header">
+            <div class="content-header-left">
+              <h2>Bugs</h2>
+              <span class="count-badge" id="bug-count"></span>
+            </div>
+            <div class="content-header-right">
+              <a id="open-in-zoho" href="#" target="_blank" class="btn btn-text" title="Open in Zoho Projects" style="display:none;">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                Open in Zoho
+              </a>
+            </div>
+          </div>
+
+          <!-- Quick Filter Chips -->
+          <div class="quick-filters">
+            <button class="qf-chip active" data-qf="">All Bugs</button>
+            <button class="qf-chip" data-qf="Open">Open</button>
+            <button class="qf-chip" data-qf="In Progress">In Progress</button>
+            <button class="qf-chip" data-qf="To be tested">To be Tested</button>
+            <button class="qf-chip" data-qf="Fixed">Fixed</button>
+            <button class="qf-chip" data-qf="Next Release">Next Release</button>
+            <button class="qf-chip" data-qf="Closed">Closed</button>
+            <button class="qf-chip" data-qf="Reopen">Reopen</button>
+          </div>
+
+          <!-- Advanced Filters Panel -->
+          <div class="filters-panel" id="filters-panel">
+            <div class="filters-toggle">
+              <button id="toggle-filters-btn" class="btn btn-text btn-sm">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                Filters
+                <svg class="toggle-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+              </button>
+            </div>
+            <div class="filters-body" id="filters-body" style="display:none;">
+              <div class="filter-row">
+                <div class="filter-item">
+                  <label>Severity</label>
+                  <select id="filter-severity">
+                    <option value="">All</option>
+                    <option value="Blocker">Blocker</option>
+                    <option value="Critical">Critical</option>
+                    <option value="Major">Major</option>
+                    <option value="Minor">Minor</option>
+                  </select>
+                </div>
+                <div class="filter-item filter-item-ms">
+                  <label>Release Milestone</label>
+                  <div class="search-select" id="milestone-dropdown">
+                    <input type="text" class="search-select-input" id="milestone-search" placeholder="Search milestone…" autocomplete="off">
+                    <input type="hidden" id="filter-milestone" value="">
+                    <span class="search-select-clear" id="milestone-clear" title="Clear" style="display:none;">&times;</span>
+                    <div class="search-select-list" id="milestone-list" style="display:none;"></div>
+                  </div>
+                </div>
+                <div class="filter-item">
+                  <label>Assignee</label>
+                  <input id="filter-assignee" type="text" placeholder="Type name…">
+                </div>
+              </div>
+              <div class="filter-actions">
+                <button id="apply-filters-btn" class="btn btn-primary btn-sm">Apply Filters</button>
+                <button id="clear-filters-btn" class="btn btn-text btn-sm">Clear All</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Split View Container -->
+          <div id="split-view" class="split-view">
+            <!-- Left: Bug List (table initially, simplified list when bug selected) -->
+            <div id="split-left" class="split-left">
+              <!-- Normal table view -->
+              <div id="table-view" class="table-view-wrap">
+                <div class="table-wrap">
+                  <table class="zp-table" id="bug-table">
+                    <thead>
+                      <tr>
+                        <th class="col-id">ID</th>
+                        <th class="col-title">Title</th>
+                        <th class="col-status">Status</th>
+                        <th class="col-severity">Severity</th>
+                        <th class="col-milestone">Milestone</th>
+                        <th class="col-assignee">Assignee</th>
+                        <th class="col-date">Created</th>
+                      </tr>
+                    </thead>
+                    <tbody id="bug-list">
+                      <tr><td colspan="7" class="empty-cell"><span class="spinner"></span> Loading bugs…</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <!-- Pagination -->
+                <div class="zp-pagination">
+                  <span class="page-info" id="page-info"></span>
+                  <div class="page-btns">
+                    <button id="prev-page" class="pg-btn" disabled title="Previous page">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+                    </button>
+                    <span class="page-num" id="page-num">1</span>
+                    <button id="next-page" class="pg-btn" title="Next page">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Simplified bug name list (shown when a bug is selected) -->
+              <div id="bug-name-list" class="bug-name-list" style="display:none;"></div>
+            </div>
+
+            <!-- Right: Bug Detail Panel (hidden until a bug is selected) -->
+            <div id="split-right" class="split-right" style="display:none;">
+              <div class="detail-panel">
+                <div class="detail-panel-header">
+                  <div class="detail-panel-header-left">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#e8443a" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                    <h2 id="modal-title"></h2>
+                  </div>
+                  <button class="detail-panel-close" id="detail-close-btn" title="Close detail">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                  </button>
+                </div>
+                <div class="detail-panel-body">
+                  <div id="modal-details" class="bug-detail-grid"></div>
+
+                  <div class="detail-panel-actions">
+                    <textarea id="extra-desc-input" class="extra-desc-input" rows="3" placeholder="Add extra context for analysis (optional)…"></textarea>
+                    <button id="analyze-btn" class="btn btn-primary btn-analyze">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/></svg>
+                      Analyze &amp; Fix
+                    </button>
+                  </div>
+
+                  <!-- Git Commit Section -->
+                  <div class="detail-panel-actions" style="border-top:none;margin-top:0;padding-top:0;">
+                    <button id="git-status-btn" class="btn btn-outline btn-sm" style="width:100%;justify-content:center;gap:6px;padding:8px 16px;">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 3v6m0 6v6"/></svg>
+                      Show Git Changes
+                    </button>
+                  </div>
+                  <div id="git-section" style="display:none;">
+                    <div class="git-panel">
+                      <div class="git-panel-header">
+                        <h3>
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 3v6m0 6v6"/></svg>
+                          Git Changes
+                        </h3>
+                        <span id="git-branch-badge" class="git-branch-badge"></span>
+                      </div>
+                      <div id="git-files-list" class="git-files-list"></div>
+                      <div class="git-commit-area">
+                        <textarea id="commit-msg-input" class="extra-desc-input" rows="2" placeholder="Commit message…"></textarea>
+                        <div class="git-commit-actions">
+                          <label class="git-select-all-label"><input type="checkbox" id="git-select-all" checked /> Select all</label>
+                          <button id="commit-btn" class="btn btn-primary btn-sm" style="gap:6px;">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+                            Commit
+                          </button>
+                        </div>
+                      </div>
+                      <div id="git-result" class="git-result" style="display:none;"></div>
+                    </div>
+                  </div>
+
+                  <div id="analysis-section" style="display:none;">
+                    <div class="detail-analysis">
+                      <div class="detail-analysis-header">
+                        <h3>
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                          Bug Analysis &amp; Fix
+                        </h3>
+                        <button id="copy-prompt-btn" class="btn btn-outline btn-sm">
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                          Copy AI Prompt
+                        </button>
+                      </div>
+
+                      <!-- Accordion container — single scrollable area -->
+                      <div id="analysis-accordions"></div>
+
+                      <!-- File code viewer (inside its own accordion) -->
+                      <div id="file-viewer-section" style="display:none;">
+                        <div id="drawer-file-tabs" class="code-file-tabs"></div>
+                        <div id="drawer-code-view" class="code-viewer">
+                          <div class="code-viewer-empty">Click "Analyze &amp; Fix" to scan your project and get fix suggestions.</div>
+                        </div>
+                        <div id="analysis-edit-area" style="display:none;">
+                          <textarea id="analysis-edit-textarea" class="analysis-edit-textarea" spellcheck="false"></textarea>
+                        </div>
+                        <div class="analysis-actions-bar">
+                          <button id="edit-toggle-btn" class="btn btn-outline btn-sm" style="gap:5px;" disabled>
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                            Edit
+                          </button>
+                          <button id="apply-changes-btn" class="btn btn-outline btn-sm" style="gap:5px;" disabled>
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                            Apply Changes
+                          </button>
+                        </div>
+                        <div id="analysis-action-result" class="git-result" style="display:none;"></div>
+                      </div>
+
+                      <!-- Diff display after changes are applied -->
+                      <div id="analysis-diff-section" style="display:none;">
+                        <div class="detail-analysis-header" style="margin-top:12px;">
+                          <h3>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18M3 12h18"/></svg>
+                            Changes Diff
+                          </h3>
+                        </div>
+                        <div id="analysis-diff-view" class="code-viewer"></div>
+                        <div class="analysis-actions-bar" style="margin-top:8px;">
+                          <button id="diff-edit-btn" class="btn btn-outline btn-sm" style="gap:5px;">
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                            Edit
+                          </button>
+                          <button id="diff-commit-btn" class="btn btn-primary btn-sm" style="gap:5px;">
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+                            Commit
+                          </button>
+                        </div>
+                        <div id="diff-commit-error" class="git-result error" style="display:none;"></div>
+                      </div>
+
+                      <div id="analysis-files" style="display:none;"></div>
+                      <pre id="analysis-prompt" style="display:none;"></pre>
+                      <ul id="relevant-files-list" style="display:none;"></ul>
+
+                      <!-- Hidden containers kept for backwards compat -->
+                      <div id="fix-explanation-section" class="fix-explanation-section" style="display:none;">
+                        <div id="fix-explanation-content" class="fix-explanation-content"></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ═══ Code Search Tab ═══ -->
+        <div id="tab-search" class="tab-content">
+          <div class="content-header">
+            <h2>Code Search</h2>
+          </div>
+          <div class="search-bar">
+            <div class="search-input-wrap">
+              <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              <input id="code-search-input" type="text" placeholder="Search file names or code content…" class="search-input">
+            </div>
+            <select id="search-type" class="search-type-select">
+              <option value="file">File Name</option>
+              <option value="grep">Code Content</option>
+            </select>
+            <button id="code-search-btn" class="btn btn-primary">Search</button>
+          </div>
+          <div id="search-results" class="search-results"></div>
+        </div>
+
+        <!-- ═══ Settings Tab ═══ -->
+        <div id="tab-settings" class="tab-content">
+          <div class="content-header"><h2>Settings</h2></div>
+          <div class="settings-card">
+            <h3 class="settings-section-title">Code Analysis</h3>
+            <p class="settings-hint">Configure how the analyzer accesses your project code.</p>
+
+            <!-- Mode selector -->
+            <div class="mode-selector">
+              <label class="mode-card">
+                <input type="radio" name="code-mode" value="agent" id="mode-agent" checked>
+                <div class="mode-card-body">
+                  <span class="mode-card-icon">🌐</span>
+                  <div>
+                    <strong>Remote Agent</strong>
+                    <small>Run <code>agent.js</code> on your machine — best for shared setups</small>
+                  </div>
+                </div>
+              </label>
+              <label class="mode-card">
+                <input type="radio" name="code-mode" value="local" id="mode-local">
+                <div class="mode-card-body">
+                  <span class="mode-card-icon">📁</span>
+                  <div>
+                    <strong>Local Directory</strong>
+                    <small>Server reads code directly — only works if server is on your machine</small>
+                  </div>
+                </div>
+              </label>
+            </div>
+
+            <!-- Agent URL (remote mode) -->
+            <div id="agent-settings" class="form-group">
+              <label>Agent URL <span id="agent-status" class="agent-dot agent-dot-unknown" title="Not checked"></span></label>
+              <div class="input-row">
+                <input id="setting-agentUrl" type="text" placeholder="http://192.168.1.50:4000">
+                <button id="check-agent-btn" class="btn btn-outline btn-sm" title="Test connection">Test</button>
+              </div>
+              <small>Run <code>node agent.js --dir "D:/YourProject/app"</code> then paste the URL</small>
+              <div id="agent-info" class="agent-info" style="display:none;"></div>
+            </div>
+
+            <!-- Local directory (local mode) -->
+            <div id="local-settings" class="form-group" style="display:none;">
+              <label>Project Directory</label>
+              <input id="setting-projectDir" type="text" placeholder="D:/Repositories/MyProject/app">
+              <small>Absolute path — only works if server runs on your machine</small>
+            </div>
+
+            <!-- Dev Server URL (for Playwright reproduction) -->
+            <div class="form-group">
+              <label>Dev Server URL <span class="settings-badge">for Playwright</span></label>
+              <input id="setting-devServerUrl" type="text" placeholder="https://localhost:4200">
+              <small>URL of your local dev server — used by Playwright to reproduce bugs</small>
+            </div>
+
+            <!-- Test credentials for Playwright login -->
+            <div class="form-row">
+              <div class="form-group">
+                <label>Test Username <span class="settings-badge">for Playwright</span></label>
+                <input id="setting-testUsername" type="text" placeholder="user@example.com">
+              </div>
+              <div class="form-group">
+                <label>Test Password <span class="settings-badge">for Playwright</span></label>
+                <input id="setting-testPassword" type="password" placeholder="••••••••">
+              </div>
+            </div>
+            <small>Credentials for your dev/testing instance — Playwright uses these to log in before reproducing bugs</small>
+
+            <hr class="settings-divider">
+            <h3 class="settings-section-title">Zoho Project</h3>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label>Portal Name</label>
+                <input id="setting-zohoPortal" type="text" placeholder="logmanagementcloud">
+              </div>
+              <div class="form-group">
+                <label>Project ID</label>
+                <input id="setting-zohoProjectId" type="text" placeholder="334688000000017255">
+              </div>
+            </div>
+
+            <hr class="settings-divider">
+            <h3 class="settings-section-title">Bug Filters</h3>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Default Assignee</label>
+                <input id="setting-defaultAssignee" type="text" placeholder="e.g. John Doe">
+                <small>Bugs will be filtered to this assignee by default on load</small>
+              </div>
+            </div>
+
+            <hr class="settings-divider">
+            <h3 class="settings-section-title">Scan Options</h3>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label>File Extensions</label>
+                <input id="setting-fileExtensions" type="text" placeholder=".js,.hbs,.css,.java,.json">
+                <small>Comma-separated</small>
+              </div>
+              <div class="form-group">
+                <label>Exclude Directories</label>
+                <input id="setting-excludeDirs" type="text" placeholder="node_modules,.git,dist,tmp">
+                <small>Comma-separated</small>
+              </div>
+            </div>
+
+            <hr class="settings-divider">
+            <h3 class="settings-section-title">AI Analysis</h3>
+
+            <!-- Copilot Bridge Status -->
+            <div id="bridge-status-group" class="form-group" style="background: var(--bg-secondary); padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border); margin-bottom: 16px;">
+              <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+                <span id="bridge-status-dot" class="agent-dot agent-dot-unknown"></span>
+                <strong style="font-size:13px;">Copilot Bridge</strong>
+                <button id="check-bridge-btn" class="btn btn-sm" type="button" style="margin-left:auto;">Check</button>
+              </div>
+              <div id="bridge-info" style="display:none; font-size:12px; margin: 4px 0;"></div>
+              <small>Uses your <strong>Copilot license</strong> for AI analysis — Claude Opus, GPT-4o, etc. No API key needed.<br>
+              To install: run <code>npx @vscode/vsce package</code> in <code>copilot-bridge/</code> folder, then <code>code --install-extension copilot-bridge-1.0.0.vsix</code></small>
+            </div>
+
+            <!-- AI Model -->
+            <div class="form-group">
+              <label>AI Model</label>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <select id="setting-aiModel" style="flex:1;">
+                  <optgroup label="GitHub Models API (needs GitHub PAT)">
+                    <option value="openai/gpt-4.1" selected>⭐ GPT-4.1 (OpenAI)</option>
+                    <option value="openai/gpt-4.1-mini">GPT-4.1 Mini</option>
+                    <option value="openai/gpt-4.1-nano">GPT-4.1 Nano</option>
+                    <option value="openai/gpt-4o">GPT-4o</option>
+                    <option value="openai/gpt-4o-mini">GPT-4o Mini</option>
+                    <option value="deepseek/DeepSeek-R1">DeepSeek R1</option>
+                    <option value="meta/llama-4-scout-17b-16e-instruct">Llama 4 Scout (Meta)</option>
+                    <option value="mistralai/mistral-large-2411">Mistral Large</option>
+                    <option value="xai/grok-3">Grok 3 (xAI)</option>
+                    <option value="xai/grok-3-mini">Grok 3 Mini (xAI)</option>
+                  </optgroup>
+                  <optgroup label="Claude (via Copilot Bridge or Anthropic Key)">
+                    <option value="claude-opus-4-6">Claude Opus 4.6</option>
+                    <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+                    <option value="claude-sonnet-4-20250514">Claude Sonnet 4</option>
+                    <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet</option>
+                  </optgroup>
+                </select>
+                <button id="discover-models-btn" class="btn btn-sm" type="button" title="Discover models available for your GitHub token" style="white-space:nowrap;">🔍 Discover</button>
+              </div>
+              <small id="model-discover-status" style="display:block; margin-top:4px;"></small>
+            </div>
+
+            <!-- GitHub PAT -->
+            <div id="github-token-group" class="form-group">
+              <label>GitHub Personal Access Token <span class="settings-badge">for GitHub Models API</span></label>
+              <input id="setting-githubToken" type="password" placeholder="github_pat_... or ghp_...">
+              <small>For GPT-4.1, DeepSeek, Grok, etc. <a href="https://github.com/settings/tokens?type=beta" target="_blank" style="color:var(--text-link)">Create PAT</a> with <code>models:read</code> scope.</small>
+            </div>
+
+            <!-- Anthropic API Key (shown when Claude selected) -->
+            <div id="claude-key-group" class="form-group" style="display:none;">
+              <label>Anthropic API Key <span class="settings-badge">for Claude without Bridge</span></label>
+              <input id="setting-claudeApiKey" type="password" placeholder="sk-ant-api03-...">
+              <small>Not needed if Copilot Bridge is running. Only for direct Anthropic API access. <a href="https://console.anthropic.com/settings/keys" target="_blank" style="color:var(--text-link)">Get key</a></small>
+            </div>
+
+            <div class="form-actions">
+              <button id="save-settings-btn" class="btn btn-primary">Save Settings</button>
+            </div>
+            <div id="settings-status" class="settings-toast" style="display:none;"></div>
+
+            <!-- Project Stats -->
+            <div id="project-stats" class="project-stats" style="display:none;">
+              <h3 class="settings-section-title">Project Stats</h3>
+              <div id="stats-content"></div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- (Bug detail is now shown inline in split-right panel above) -->
+
+  <!-- ═══ Analysis / Diff Modal ═══ -->
+  <div id="diff-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-dialog modal-fullwidth">
+      <div class="modal-header">
+        <div class="modal-header-left">
+          <span class="modal-bug-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--zp-blue)" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          </span>
+          <h2 id="diff-title">Code Analysis</h2>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button id="diff-copy-btn" class="btn btn-outline btn-sm">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            Copy AI Prompt
+          </button>
+          <button class="modal-close" title="Close">&times;</button>
+        </div>
+      </div>
+      <div class="diff-body">
+        <aside class="diff-sidebar">
+          <div class="diff-sidebar-title">Relevant Files</div>
+          <div id="diff-file-list" class="diff-file-list"></div>
+        </aside>
+        <div class="diff-content">
+          <div class="diff-file-header" id="diff-file-header">Select a file to view</div>
+          <div class="diff-code-wrap">
+            <div class="diff-code" id="diff-code"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ File Viewer Modal ═══ -->
+  <div id="file-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-dialog modal-wide">
+      <div class="modal-header">
+        <h2 id="file-modal-title"></h2>
+        <button class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <pre id="file-content" class="code-box"></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Commit Changes Modal ═══ -->
+  <div id="commit-modal" class="modal" style="display:none;">
+    <div class="modal-backdrop"></div>
+    <div class="modal-dialog" style="max-width:520px;">
+      <div class="modal-header">
+        <div class="modal-header-left">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--zp-blue)" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 3v6m0 6v6"/></svg>
+          <h2>Commit Changes</h2>
+        </div>
+        <button class="modal-close" id="commit-modal-close" title="Close">&times;</button>
+      </div>
+      <div class="modal-body" style="padding:16px 20px;">
+        <div class="commit-modal-section">
+          <label class="commit-modal-label">Commit Message</label>
+          <textarea id="commit-modal-msg" class="commit-modal-textarea" rows="3" placeholder="fix: describe the changes…"></textarea>
+        </div>
+        <div class="commit-modal-section">
+          <div class="commit-modal-files-header">
+            <label class="commit-modal-label">Files to Commit</label>
+            <label class="commit-modal-select-all"><input type="checkbox" id="commit-modal-select-all" checked /> Select all</label>
+          </div>
+          <div id="commit-modal-files" class="commit-modal-files"></div>
+        </div>
+        <div id="commit-modal-result" class="git-result" style="display:none;"></div>
+        <div class="commit-modal-actions">
+          <button id="commit-modal-cancel" class="btn btn-outline btn-sm">Cancel</button>
+          <button id="commit-modal-submit" class="btn btn-primary btn-sm" style="gap:6px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+            Commit Selected
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
