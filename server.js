@@ -571,6 +571,7 @@ function handleRequest(req, res) {
       readBody(req, function (bodyErr, body) {
         var extraDescription = (body && body.extraDescription) ? body.extraDescription : '';
         var targetRoute = (body && body.targetRoute) ? body.targetRoute : '';
+        var includeImages = body && body.includeImages !== false; // default true
         console.log('');
         console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.log('[STEP 1/6] 📥 Analyze request received');
@@ -589,6 +590,11 @@ function handleRequest(req, res) {
           console.log('  Title:', (bugData.bug.title || '').substring(0, 80));
           console.log('  Status:', bugData.bug.status, '| Severity:', bugData.bug.severity);
           console.log('  Attachments:', (bugData.attachments || []).length, '| Comments:', (bugData.comments || []).length);
+
+          // Download image attachments for vision analysis (optional, controlled by user toggle)
+          var _bugImages = [];
+          function proceedAfterImages() {
+
           var analyzeUser = userStore.getUser(userId);
           // Store parsed structured description for use in interaction steps & fix prompt
           var _parsedDesc = null;
@@ -699,6 +705,7 @@ function handleRequest(req, res) {
                 analysis: result.analysis,
                 bug: bugData.bug,
                 agentError: agentError || null,
+                bugImages: _bugImages.length,
                 aiFix: {
                   text: aiResult.text,
                   model: aiResult.model,
@@ -719,6 +726,7 @@ function handleRequest(req, res) {
                 analysis: result.analysis,
                 bug: bugData.bug,
                 agentError: agentError || null,
+                bugImages: _bugImages.length,
                 aiFix: null,
                 aiError: errMsg,
                 reproduction: reproResult || null
@@ -1045,6 +1053,7 @@ function handleRequest(req, res) {
                       bugConfirmed: bugConfirmed,
                       assertions: assertions,
                       navigationOk: navigationOk,
+                      pageUrl: runResult.pageUrl || null,
                       status: status,
                       output: runResult.output,
                       duration: runResult.duration,
@@ -1075,6 +1084,26 @@ function handleRequest(req, res) {
             // Run reproduction first, then AI analysis
             attemptReproduction(function (reproResult) {
 
+            // If bug was NOT reproduced (assertions ran and passed), skip code fix
+            if (reproResult && reproResult.attempted && !reproResult.bugConfirmed && !reproResult.reproduced &&
+                reproResult.status === 'assertions-passed') {
+              console.log('');
+              console.log('[STEP 5/6] ✅ Bug not reproduced — skipping AI code fix generation');
+              console.log('  Assertions confirmed the bug is NOT present');
+              console.log('  Total time:', ((Date.now() - _analyzeStart) / 1000).toFixed(1) + 's');
+              console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+              return sendJSON(res, 200, {
+                prompt: result.prompt,
+                analysis: result.analysis,
+                bug: bugData.bug,
+                agentError: agentError || null,
+                bugImages: _bugImages.length,
+                aiFix: null,
+                fixSkipped: 'Bug was not reproduced — assertions verified the bug condition is not present. No code fix needed.',
+                reproduction: reproResult
+              });
+            }
+
             // Step 1: Try Copilot Bridge first (free, works for Claude + GPT-4o + more)
             console.log('');
             console.log('[STEP 5/6] 🤖 Sending prompt to AI...');
@@ -1082,7 +1111,8 @@ function handleRequest(req, res) {
             copilotBridge.checkHealth(function (hErr, hData) {
               if (!hErr && hData && hData.ok) {
                 console.log('[STEP 5/6] ✅ Copilot Bridge available — sending to model:', aiModel);
-                copilotBridge.analyze(result.prompt, aiModel, function (bErr, bResult) {
+                if (_bugImages.length > 0) console.log('  Including', _bugImages.length, 'bug screenshot(s) for vision analysis');
+                copilotBridge.analyze(result.prompt, aiModel, { images: _bugImages }, function (bErr, bResult) {
                   if (!bErr) return sendFinalResponse(bResult, reproResult);
                   console.log('[STEP 5/6] ⚠️ Copilot Bridge failed:', bErr.message, '— trying fallback...');
                   tryFallback(reproResult);
@@ -1100,7 +1130,7 @@ function handleRequest(req, res) {
                 if (claudeKey) {
                   console.log('[STEP 5/6] 📡 Using Anthropic Direct API — model:', aiModel);
                   console.log('  Waiting for Claude response (may take 30-120s)...');
-                  claudeClient.analyze(claudeKey, result.prompt, { model: aiModel }, function (clErr, clResult) {
+                  claudeClient.analyze(claudeKey, result.prompt, { model: aiModel, images: _bugImages }, function (clErr, clResult) {
                     if (!clErr) return sendFinalResponse(clResult, reproRes);
                     sendError('Anthropic API: ' + clErr.message, reproRes);
                   });
@@ -1114,7 +1144,7 @@ function handleRequest(req, res) {
                 if (githubToken) {
                   console.log('[STEP 5/6] 📡 Using GitHub Models API — model:', aiModel);
                   console.log('  Waiting for AI response (may take 30-120s)...');
-                  githubAI.analyze(githubToken, result.prompt, { model: aiModel }, function (ghErr, ghResult) {
+                  githubAI.analyze(githubToken, result.prompt, { model: aiModel, images: _bugImages }, function (ghErr, ghResult) {
                     if (!ghErr) return sendFinalResponse(ghResult, reproRes);
                     sendError('GitHub Models API: ' + ghErr.message, reproRes);
                   });
@@ -1182,6 +1212,23 @@ function handleRequest(req, res) {
 
           // Entry point: auto-detect route then continue
           autoDetectAndContinue();
+          } // end proceedAfterImages
+
+          if (includeImages && (bugData.attachments || []).length > 0) {
+            console.log('[STEP 2/6] \uD83D\uDDBC\uFE0F Downloading bug screenshots for AI vision...');
+            bugService.downloadBugImages(userId, bugData.attachments, function (imgErr, images) {
+              if (!imgErr && images && images.length > 0) {
+                _bugImages = images;
+                console.log('[STEP 2/6] \u2705 Downloaded', images.length, 'bug screenshot(s)');
+              } else if (imgErr) {
+                console.log('[STEP 2/6] \u26A0\uFE0F Image download error:', imgErr.message, '\u2014 continuing without images');
+              }
+              proceedAfterImages();
+            });
+          } else {
+            if (!includeImages) console.log('[STEP 2/6] \uD83D\uDDBC\uFE0F Screenshots excluded by user');
+            proceedAfterImages();
+          }
         });
       });
       return;

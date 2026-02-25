@@ -780,7 +780,9 @@
     var extraDesc = document.getElementById('extra-desc-input').value.trim();
     extraDescCache[currentBugId] = extraDesc;
     var routeVal = targetRouteInput ? targetRouteInput.value.trim() : '';
-    var body = { extraDescription: extraDesc, targetRoute: routeVal };
+    var includeImagesCb = document.getElementById('include-images-cb');
+    var includeImages = includeImagesCb ? includeImagesCb.checked : true;
+    var body = { extraDescription: extraDesc, targetRoute: routeVal, includeImages: includeImages };
 
     apiPost('/api/bugs/' + currentBugId + '/analyze', body, function (status, data) {
       analyzeBtn.disabled = false;
@@ -1093,8 +1095,13 @@
             var a = repro.assertions[ai];
             var icon = a.matched ? '\uD83D\uDD34' : '\u2705';
             reproBody += '<div class="repro-assert-item">';
-            reproBody += '<span>' + icon + ' Step ' + a.step + ': <code>' + esc(a.attribute || '') + '</code> = <code>' + esc(a.actual || '') + '</code>';
-            reproBody += (a.matched ? ' \u2014 matches bug condition' : ' \u2014 correct value') + '</span>';
+            if (a.status === 'element-not-found') {
+              reproBody += '<span>' + icon + ' Step ' + a.step + ': Element <code>' + esc(a.selector || '') + '</code> not found on page';
+              reproBody += (a.matched ? ' \u2014 bug condition' : ' \u2014 element absent') + '</span>';
+            } else {
+              reproBody += '<span>' + icon + ' Step ' + a.step + ': <code>' + esc(a.attribute || '') + '</code> = <code>' + esc(a.actual || '') + '</code>';
+              reproBody += (a.matched ? ' \u2014 matches bug condition' : ' \u2014 correct value') + '</span>';
+            }
             reproBody += '</div>';
           }
           reproBody += '</div>';
@@ -1135,8 +1142,13 @@
         for (var ai2 = 0; ai2 < repro.assertions.length; ai2++) {
           var a2 = repro.assertions[ai2];
           reproBody += '<div class="repro-assert-item">';
-          reproBody += '<span>\u2705 Step ' + a2.step + ': <code>' + esc(a2.attribute || '') + '</code> = <code>' + esc(a2.actual || '') + '</code>';
-          reproBody += ' (expected buggy: <code>' + esc(a2.expected || '') + '</code>)</span>';
+          if (a2.status === 'element-not-found') {
+            reproBody += '<span>\u2705 Step ' + a2.step + ': Element <code>' + esc(a2.selector || '') + '</code> not found';
+            reproBody += ' \u2014 checked element is absent (page likely navigated away)</span>';
+          } else {
+            reproBody += '<span>\u2705 Step ' + a2.step + ': <code>' + esc(a2.attribute || '') + '</code> = <code>' + esc(a2.actual || '') + '</code>';
+            reproBody += ' (expected buggy: <code>' + esc(a2.expected || '') + '</code>)</span>';
+          }
           reproBody += '</div>';
         }
         reproBody += '</div>';
@@ -1154,6 +1166,9 @@
           reproBody += '<span><strong>Could Not Reproduce</strong> \u2014 Playwright test passed, the bug was not triggered</span>';
           reproBody += '</div>';
         }
+      }
+      if (repro.pageUrl) {
+        reproBody += '<div class="repro-meta repro-final-url">\uD83D\uDD17 Final URL: <code>' + esc(repro.pageUrl) + '</code></div>';
       }
       if (repro.duration) {
         reproBody += '<div class="repro-meta">Duration: ' + Math.round(repro.duration / 1000) + 's';
@@ -1205,6 +1220,9 @@
       }
       aiBody += '</div>';
       var modelBadge = data.aiFix.model || 'AI';
+      if (data.bugImages && data.bugImages > 0) {
+        modelBadge += ' \u00B7 \uD83D\uDDBC\uFE0F ' + data.bugImages + ' screenshot' + (data.bugImages > 1 ? 's' : '');
+      }
       html += makeAccordion('ai', '\uD83E\uDDE0', 'AI Analysis', modelBadge, aiBody, { open: true });
 
       // ── 3. Per-file diff accordions with Edit & Apply buttons ──
@@ -1235,6 +1253,14 @@
       errBody += '<p class="fix-hint">Check your API key and selected model in Settings \u2192 AI Analysis.</p>';
       errBody += '</div>';
       html += makeAccordion('ai-error', '\u26A0\uFE0F', 'AI Error', '', errBody, { open: true, badgeColor: 'red' });
+    } else if (data.fixSkipped) {
+      var skipBody = '<div class="acc-body-inner fix-skipped-body">';
+      skipBody += '<div class="fix-skipped-icon">\u2705</div>';
+      skipBody += '<div class="fix-skipped-msg">' + esc(data.fixSkipped) + '</div>';
+      skipBody += '<p class="fix-skipped-hint">The reproduction test verified that the bug condition is not present. ';
+      skipBody += 'If you believe this is incorrect, you can re-analyze with different parameters.</p>';
+      skipBody += '</div>';
+      html += makeAccordion('ai-skipped', '\u2705', 'Code Fix', 'Skipped', skipBody, { open: true, badgeColor: 'green' });
     }
 
     // ── Action bar — Commit + Verify buttons ──

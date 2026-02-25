@@ -1312,6 +1312,33 @@ a:hover { text-decoration: underline; }
 .route-input-row {
   margin-bottom: 8px;
 }
+
+/* Include screenshots toggle */
+.include-images-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 4px 0;
+  margin-bottom: 6px;
+  user-select: none;
+}
+.include-images-toggle input[type="checkbox"] {
+  margin: 0;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.include-images-toggle svg {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.include-images-toggle .toggle-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-style: italic;
+}
 .route-input-group {
   display: flex;
   flex-direction: column;
@@ -1442,6 +1469,18 @@ a:hover { text-decoration: underline; }
   font-size: 11px;
   color: var(--text-muted);
   padding: 6px 16px 0;
+}
+.repro-final-url {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.repro-final-url code {
+  background: var(--bg-secondary);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  word-break: break-all;
 }
 
 .repro-output-details {
@@ -1838,6 +1877,29 @@ h4.fix-ai-h { font-size: 13px; }
   font-size: 12px;
   color: var(--text-muted);
   margin-bottom: 4px;
+}
+
+/* Fix skipped (bug not reproduced) */
+.fix-skipped-body {
+  text-align: center;
+  padding: 24px 16px;
+}
+.fix-skipped-icon {
+  font-size: 36px;
+  margin-bottom: 8px;
+}
+.fix-skipped-msg {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--green);
+  margin-bottom: 8px;
+}
+.fix-skipped-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  max-width: 420px;
+  margin: 0 auto;
+  line-height: 1.5;
 }
 .fix-hint-list {
   padding-left: 18px;

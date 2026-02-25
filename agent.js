@@ -1592,6 +1592,7 @@ function runReproScript(testFileName, callback) {
         bugConfirmed: bugConfirmed,
         assertions: assertions,
         navigationOk: navigationOk,
+        pageUrl: parsed ? parsed.pageUrl : null,
         output: fullOutput.substring(0, 5000),
         duration: duration,
         screenshotFile: hasScreenshot ? path.basename(screenshotFile) : null,

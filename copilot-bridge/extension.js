@@ -55,6 +55,7 @@ async function getAvailableModels() {
 async function handleAnalyze(body) {
   const modelFamily = body.modelFamily || 'claude-opus-4';
   const prompt      = body.prompt      || '';
+  const images      = body.images      || [];
 
   if (!prompt) { throw new Error('No prompt provided'); }
 
@@ -79,8 +80,29 @@ async function handleAnalyze(body) {
     );
   }
 
-  const model    = models[0];
-  const messages  = [vscode.LanguageModelChatMessage.User(prompt)];
+  const model = models[0];
+
+  // Build message parts — try multimodal if images available
+  let messages;
+  if (images.length > 0 && vscode.LanguageModelTextPart) {
+    // VS Code 1.100+ supports multimodal content parts
+    try {
+      const parts = [];
+      for (const img of images) {
+        const buffer = Buffer.from(img.base64, 'base64');
+        parts.push(new vscode.LanguageModelDataPart(img.mediaType || 'image/png', buffer, img.name || 'bug-screenshot'));
+      }
+      parts.push(new vscode.LanguageModelTextPart(prompt));
+      messages = [vscode.LanguageModelChatMessage.User(parts)];
+      console.log('[copilot-bridge] Using multimodal message with', images.length, 'image(s)');
+    } catch (e) {
+      // Fallback to text-only if multimodal parts not supported
+      console.log('[copilot-bridge] Multimodal parts not available:', e.message, '— falling back to text-only');
+      messages = [vscode.LanguageModelChatMessage.User(prompt)];
+    }
+  } else {
+    messages = [vscode.LanguageModelChatMessage.User(prompt)];
+  }
 
   // Cancellation token with 2-minute timeout
   const cts = new vscode.CancellationTokenSource();
