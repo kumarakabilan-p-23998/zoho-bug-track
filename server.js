@@ -213,30 +213,106 @@ function handleRequest(req, res) {
         }
         userStore.saveUser(userId, saveData);
 
-        // If this is a fresh user (no projectDir/agentUrl), try to inherit settings
-        // from a previous user with the same name or ZUID
-        var freshUser = userStore.getUser(userId);
-        if (!freshUser.projectDir && !freshUser.agentUrl) {
-          var donor = userStore.findExistingUser(userId, userName);
-          if (donor) {
-            console.log('Inheriting settings from previous user:', donor.userId, '->', userId);
-            var inherit = {};
-            if (donor.projectDir) inherit.projectDir = donor.projectDir;
-            if (donor.agentUrl) inherit.agentUrl = donor.agentUrl;
-            if (donor.zohoPortal) inherit.zohoPortal = donor.zohoPortal;
-            if (donor.zohoProjectId) inherit.zohoProjectId = donor.zohoProjectId;
-            if (donor.defaultAssignee) inherit.defaultAssignee = donor.defaultAssignee;
-            if (donor.githubToken) inherit.githubToken = donor.githubToken;
-            if (donor.claudeApiKey) inherit.claudeApiKey = donor.claudeApiKey;
-            if (donor.aiModel) inherit.aiModel = donor.aiModel;
-            if (donor.fileExtensions) inherit.fileExtensions = donor.fileExtensions;
-            if (donor.excludeDirs) inherit.excludeDirs = donor.excludeDirs;
-            if (donor.zohoZuid) inherit.zohoZuid = donor.zohoZuid;
-            if (Object.keys(inherit).length > 0) {
-              userStore.saveUser(userId, inherit);
+        // ── Try to restore settings from the local agent ──
+        // The agent persists settings across token refreshes and userId changes.
+        // This is the primary restoration method — more reliable than findExistingUser.
+        function restoreFromAgentThenContinue() {
+          // Try known agent URLs: existing user's agentUrl, or default localhost:4000
+          var freshUser0 = userStore.getUser(userId);
+          var agentUrlsToTry = [];
+          if (freshUser0.agentUrl) agentUrlsToTry.push(freshUser0.agentUrl);
+          agentUrlsToTry.push('http://localhost:4000');
+          // Deduplicate
+          var unique = [];
+          var seen = {};
+          agentUrlsToTry.forEach(function (u) { if (!seen[u]) { seen[u] = true; unique.push(u); } });
+
+          function tryNextAgent(idx) {
+            if (idx >= unique.length) {
+              // No agent responded — fall back to findExistingUser
+              return fallbackInheritThenFinish();
+            }
+            var tryUrl = unique[idx];
+            console.log('[login] Trying to restore settings from agent:', tryUrl);
+            agentProxy.loadSettings(tryUrl).then(function (agentData) {
+              if (agentData && agentData.settings && Object.keys(agentData.settings).length > 0) {
+                var s = agentData.settings;
+                console.log('[login] ✅ Settings restored from agent! Fields:', Object.keys(s).length);
+                var restore = {};
+                // Restore all settings except zohoTokens (we have fresh tokens from OAuth)
+                if (s.agentUrl) restore.agentUrl = s.agentUrl;
+                if (s.zohoPortal) restore.zohoPortal = s.zohoPortal;
+                if (s.zohoProjectId) restore.zohoProjectId = s.zohoProjectId;
+                if (s.defaultAssignee) restore.defaultAssignee = s.defaultAssignee;
+                if (s.zohoZuid) restore.zohoZuid = s.zohoZuid;
+                if (s.githubToken) restore.githubToken = s.githubToken;
+                if (s.claudeApiKey) restore.claudeApiKey = s.claudeApiKey;
+                if (s.aiModel) restore.aiModel = s.aiModel;
+                if (s.fileExtensions) restore.fileExtensions = s.fileExtensions;
+                if (s.excludeDirs) restore.excludeDirs = s.excludeDirs;
+                if (s.devServerUrl) restore.devServerUrl = s.devServerUrl;
+                if (s.testUsername) restore.testUsername = s.testUsername;
+                if (s.testPassword) restore.testPassword = s.testPassword;
+                if (s.name && !userName || userName === 'Zoho User') restore.name = s.name;
+                if (s.email && !userEmail) restore.email = s.email;
+
+                if (Object.keys(restore).length > 0) {
+                  userStore.saveUser(userId, restore);
+                  console.log('[login] Restored:', Object.keys(restore).join(', '));
+                }
+
+                // Also update the agent with fresh tokens so it stays in sync
+                agentProxy.saveSettings(tryUrl, {
+                  zohoTokens: {
+                    accessToken: accessToken,
+                    refreshToken: refreshToken,
+                    expiresAt: Date.now() + expiresIn - 60000
+                  },
+                  name: userName || s.name || '',
+                  email: userEmail || s.email || ''
+                }).catch(function (e) { /* ignore */ });
+
+                return finishLogin();
+              }
+              // Agent had no settings — try next
+              tryNextAgent(idx + 1);
+            }).catch(function (err) {
+              console.log('[login] Agent', tryUrl, 'not available:', err.message);
+              tryNextAgent(idx + 1);
+            });
+          }
+
+          tryNextAgent(0);
+        }
+
+        // Fallback: inherit from a previous user file (old method)
+        function fallbackInheritThenFinish() {
+          var freshUser = userStore.getUser(userId);
+          if (!freshUser.projectDir && !freshUser.agentUrl) {
+            var donor = userStore.findExistingUser(userId, userName);
+            if (donor) {
+              console.log('Inheriting settings from previous user:', donor.userId, '->', userId);
+              var inherit = {};
+              if (donor.projectDir) inherit.projectDir = donor.projectDir;
+              if (donor.agentUrl) inherit.agentUrl = donor.agentUrl;
+              if (donor.zohoPortal) inherit.zohoPortal = donor.zohoPortal;
+              if (donor.zohoProjectId) inherit.zohoProjectId = donor.zohoProjectId;
+              if (donor.defaultAssignee) inherit.defaultAssignee = donor.defaultAssignee;
+              if (donor.githubToken) inherit.githubToken = donor.githubToken;
+              if (donor.claudeApiKey) inherit.claudeApiKey = donor.claudeApiKey;
+              if (donor.aiModel) inherit.aiModel = donor.aiModel;
+              if (donor.fileExtensions) inherit.fileExtensions = donor.fileExtensions;
+              if (donor.excludeDirs) inherit.excludeDirs = donor.excludeDirs;
+              if (donor.zohoZuid) inherit.zohoZuid = donor.zohoZuid;
+              if (Object.keys(inherit).length > 0) {
+                userStore.saveUser(userId, inherit);
+              }
             }
           }
+          finishLogin();
         }
+
+        function finishLogin() {
 
         // Create session
         var sessionToken = userStore.createSession(userId, { name: userName, email: userEmail });
@@ -299,6 +375,16 @@ function handleRequest(req, res) {
               }
               userStore.saveUser(userId, detectUpdates);
 
+              // Sync updated identity to agent
+              var currentForSync = userStore.getUser(userId);
+              if (currentForSync.agentUrl) {
+                agentProxy.saveSettings(currentForSync.agentUrl, {
+                  defaultAssignee: bestName,
+                  name: bestName,
+                  zohoZuid: detectUpdates.zohoZuid || ''
+                }).catch(function (e) { /* ignore */ });
+              }
+
               // Now that we know the real name, inherit settings if still unconfigured
               var currentUser = userStore.getUser(userId);
               if (!currentUser.projectDir && !currentUser.agentUrl) {
@@ -318,6 +404,12 @@ function handleRequest(req, res) {
             }
           });
         })();
+
+        } // end finishLogin
+
+        // Kick off the restore chain: agent → findExistingUser → finishLogin
+        restoreFromAgentThenContinue();
+
       });
     });
     return;
@@ -381,6 +473,36 @@ function handleRequest(req, res) {
         }
 
         var updated = userStore.saveUser(userId, allowed);
+
+        // ── Sync settings to agent for persistent local storage ──
+        // This ensures settings survive across token refreshes and re-logins
+        var savedUser = userStore.getUser(userId);
+        if (savedUser.agentUrl) {
+          var settingsToSync = {
+            agentUrl: savedUser.agentUrl,
+            zohoPortal: savedUser.zohoPortal,
+            zohoProjectId: savedUser.zohoProjectId,
+            defaultAssignee: savedUser.defaultAssignee,
+            zohoZuid: savedUser.zohoZuid || '',
+            githubToken: savedUser.githubToken,
+            claudeApiKey: savedUser.claudeApiKey,
+            aiModel: savedUser.aiModel,
+            fileExtensions: savedUser.fileExtensions,
+            excludeDirs: savedUser.excludeDirs,
+            devServerUrl: savedUser.devServerUrl || '',
+            testUsername: savedUser.testUsername || '',
+            testPassword: savedUser.testPassword || '',
+            name: savedUser.name || '',
+            email: savedUser.email || '',
+            zohoTokens: savedUser.zohoTokens || {}
+          };
+          agentProxy.saveSettings(savedUser.agentUrl, settingsToSync).then(function () {
+            console.log('[settings] ✅ Settings synced to agent at', savedUser.agentUrl);
+          }).catch(function (syncErr) {
+            console.log('[settings] ⚠️ Failed to sync settings to agent:', syncErr.message);
+          });
+        }
+
         sendJSON(res, 200, userStore.getUserPublic(userId));
       });
       return;
@@ -833,6 +955,29 @@ function handleRequest(req, res) {
               lines.push('- { "action": "screenshot", "name": "step_name", "description": "why" }');
               lines.push('- { "action": "assert", "selector": "CSS selector", "attribute": "placeholder|textContent|innerText|value|class|title|aria-label|etc", "expected": "expected BUGGY value", "compare": "equals|contains", "description": "what the assert verifies" }');
               lines.push('');
+              lines.push('## IMPORTANT: Setup-Action-Verify Pattern for Destructive / Mutating Bugs');
+              lines.push('If the bug involves a DESTRUCTIVE or MUTATING action (delete, remove, disable, revoke, reset, unlink, detach, clear, etc.),');
+              lines.push('you MUST follow this 3-phase pattern:');
+              lines.push('');
+              lines.push('**Phase 1 — Setup:** Create a TEST entity first so there is something to act on.');
+              lines.push('- Navigate to the create/add page for that entity.');
+              lines.push('- Fill required fields using test data. Use the prefix "__bugtrack_test_" for any name/label fields (e.g., "__bugtrack_test_svc_1").');
+              lines.push('- Submit/save and wait for creation to succeed.');
+              lines.push('- Add an assert step to confirm the test entity now appears in the list.');
+              lines.push('- Look at the HBS templates provided above to find the correct form fields, input selectors, and save button selectors.');
+              lines.push('');
+              lines.push('**Phase 2 — Action:** Perform the bug action on the TEST entity you just created.');
+              lines.push('- Find the test entity by its unique name (e.g., look for element containing "__bugtrack_test_").');
+              lines.push('- Perform the destructive action (click delete button, confirm dialog, etc.).');
+              lines.push('');
+              lines.push('**Phase 3 — Verify:** Assert the expected buggy behavior.');
+              lines.push('- Add assert steps checking whether the bug is present (e.g., entity still appears after deletion = bug confirmed).');
+              lines.push('- Take a screenshot after the action.');
+              lines.push('');
+              lines.push('This pattern ensures we NEVER delete or modify real/existing data during reproduction.');
+              lines.push('For EDIT/UPDATE bugs, also create a test entity first, then edit it, then verify.');
+              lines.push('For READ-ONLY bugs (display issues, wrong text, styling), skip the setup phase and interact directly.');
+              lines.push('');
               lines.push('Guidelines:');
               lines.push('- Use CSS selectors that match the HBS template elements. Prefer class selectors, data attributes, or IDs.');
               lines.push('- Ember uses {{action "name"}} — map these to their containing element\'s CSS class/ID.');
@@ -842,7 +987,8 @@ function handleRequest(req, res) {
               lines.push('- The assert "expected" value is the WRONG/BUGGY value (what the bug says is happening, not what SHOULD happen).');
               lines.push('- If the bug is visual (wrong text, placeholder, label, CSS), assert the text/attribute.');
               lines.push('- If the bug is behavioral (clicking X does Y wrong), assert the state after the action.');
-              lines.push('- Keep the sequence practical: 5-15 steps typically suffice.');
+              lines.push('- For destructive bugs, follow the Setup-Action-Verify pattern above — never operate on existing real data.');
+              lines.push('- Keep the sequence practical: 5-20 steps typically suffice (setup phases may need more steps).');
               lines.push('');
               lines.push('Return ONLY a valid JSON array. No explanation, no markdown fences, no text before or after the JSON.');
 

@@ -330,12 +330,19 @@ var childProcess = require('child_process');
 
 var BUG_TRACKER_DATA_DIR = path.join(__dirname, 'data', 'agent-data');
 var PROMPTS_DIR = path.join(BUG_TRACKER_DATA_DIR, 'prompts');
+// Settings stored OUTSIDE repo — in user home dir to avoid pushing credentials
+var SETTINGS_DIR = path.join(process.env.USERPROFILE || process.env.HOME || os.homedir(), '.zoho-bug-track');
+var SETTINGS_FILE = path.join(SETTINGS_DIR, 'settings.json');
 try {
   if (!fs.existsSync(BUG_TRACKER_DATA_DIR)) {
     fs.mkdirSync(BUG_TRACKER_DATA_DIR);
   }
   if (!fs.existsSync(PROMPTS_DIR)) {
     fs.mkdirSync(PROMPTS_DIR);
+  }
+  if (!fs.existsSync(SETTINGS_DIR)) {
+    fs.mkdirSync(SETTINGS_DIR);
+    console.log('[agent] Created settings dir:', SETTINGS_DIR);
   }
   // Ensure package.json exists so npm install works in this dir
   var pkgFile = path.join(BUG_TRACKER_DATA_DIR, 'package.json');
@@ -2236,6 +2243,46 @@ function handleRequest(req, res) {
     var promptBugId = pathname.match(/^\/prompts\/([a-zA-Z0-9_]+)$/)[1];
     var logResult = loadPromptLog(promptBugId);
     sendJSON(res, 200, logResult);
+    return;
+  }
+
+  // GET /settings — load persisted settings from agent
+  if (pathname === '/settings' && req.method === 'GET') {
+    var settingsData = null;
+    try {
+      if (fs.existsSync(SETTINGS_FILE)) {
+        settingsData = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
+      }
+    } catch (e) {
+      console.log('[agent] Settings read error:', e.message);
+    }
+    sendJSON(res, 200, { ok: true, settings: settingsData });
+    return;
+  }
+
+  // POST /settings — persist settings locally on agent
+  if (pathname === '/settings' && req.method === 'POST') {
+    readAgentBody(req, function (bodyErr, body) {
+      if (bodyErr) { sendJSON(res, 400, { error: bodyErr.message }); return; }
+      try {
+        // Merge with existing settings (don't overwrite fields not sent)
+        var existing = {};
+        if (fs.existsSync(SETTINGS_FILE)) {
+          try { existing = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8')); } catch (e2) { /* ignore */ }
+        }
+        var merged = existing;
+        Object.keys(body).forEach(function (k) {
+          merged[k] = body[k];
+        });
+        merged.updatedAt = new Date().toISOString();
+        fs.writeFileSync(SETTINGS_FILE, JSON.stringify(merged, null, 2), 'utf-8');
+        console.log('[agent] ✅ Settings saved (' + Object.keys(body).length + ' fields)');
+        sendJSON(res, 200, { ok: true });
+      } catch (e) {
+        console.log('[agent] Settings write error:', e.message);
+        sendJSON(res, 500, { error: 'Failed to save settings: ' + e.message });
+      }
+    });
     return;
   }
 
