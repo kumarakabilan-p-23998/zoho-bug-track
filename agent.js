@@ -1003,6 +1003,220 @@ function readComponentTemplates(componentNames) {
 }
 
 /**
+ * Extract service injections, mixin imports, and helper references from Ember JS source.
+ * Returns { services: [], mixins: [], helpers: [] }
+ */
+function extractJSDependencies(jsContent) {
+  if (!jsContent) return { services: [], mixins: [], helpers: [] };
+  var deps = { services: [], mixins: [], helpers: [] };
+
+  // ── Service injections ──
+  // Patterns: Ember.inject.service('name'), Ember.inject.service(), service: Ember.inject.service('name')
+  var svcRegex = /Ember\.inject\.service\(\s*['"]([a-zA-Z0-9_-]+)['"]\s*\)/g;
+  var m;
+  while ((m = svcRegex.exec(jsContent)) !== null) {
+    if (deps.services.indexOf(m[1]) === -1) deps.services.push(m[1]);
+  }
+  // Also match: property: Ember.inject.service()  (service name = property name)
+  var svcImplicit = /([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*Ember\.inject\.service\(\s*\)/g;
+  while ((m = svcImplicit.exec(jsContent)) !== null) {
+    var svcName = m[1].replace(/([A-Z])/g, function (ch) { return '-' + ch.toLowerCase(); });
+    if (deps.services.indexOf(svcName) === -1) deps.services.push(svcName);
+  }
+
+  // ── Mixin imports via import statement ──
+  // import SomeMixin from '../mixins/some-mixin';
+  // import FooMixin from 'app/mixins/foo-mixin';
+  var importRegex = /import\s+\w+\s+from\s+['"]((?:\.\.\/?)+|[a-zA-Z0-9_-]+\/)(?:.*\/)?mixins\/([a-zA-Z0-9_/-]+)['"]/g;
+  while ((m = importRegex.exec(jsContent)) !== null) {
+    if (deps.mixins.indexOf(m[2]) === -1) deps.mixins.push(m[2]);
+  }
+
+  // ── Mixin imports via require ──
+  // require('../mixins/some-mixin')
+  var requireMixinRegex = /require\s*\(\s*['"](?:\.\.\/?)*(?:.*\/)?mixins\/([a-zA-Z0-9_/-]+)['"]\s*\)/g;
+  while ((m = requireMixinRegex.exec(jsContent)) !== null) {
+    if (deps.mixins.indexOf(m[1]) === -1) deps.mixins.push(m[1]);
+  }
+
+  // ── Helper references in templates (extracted from the template HBS side) ──
+  // This is called separately for templates; here we just note .extend() mixins
+  // e.g., Ember.Component.extend(SomeMixin, { ... })
+  var extendMixinRegex = /\.extend\s*\(\s*([A-Z][a-zA-Z0-9_]*(?:\s*,\s*[A-Z][a-zA-Z0-9_]*)*)\s*,/g;
+  while ((m = extendMixinRegex.exec(jsContent)) !== null) {
+    var mixinNames = m[1].split(/\s*,\s*/);
+    for (var mi = 0; mi < mixinNames.length; mi++) {
+      var mn = mixinNames[mi].trim();
+      if (mn && /^[A-Z]/.test(mn) && mn !== 'Ember' && mn.length > 2) {
+        // Convert PascalCase to kebab-case for file lookup
+        var kebab = mn.replace(/([A-Z])/g, function (ch, _, idx) {
+          return (idx > 0 ? '-' : '') + ch.toLowerCase();
+        });
+        if (deps.mixins.indexOf(kebab) === -1) deps.mixins.push(kebab);
+      }
+    }
+  }
+
+  return deps;
+}
+
+/**
+ * Extract helper references from HBS template.
+ * Looks for {{helper-name ...}} calls that are NOT components (no dash-prefix or known helpers).
+ */
+function extractHelperRefs(hbsContent) {
+  if (!hbsContent) return [];
+  var helpers = [];
+  // Match helpers: single-word-with-hyphen usages that are not components
+  // Helpers are called like {{format-date value}} or {{my-helper param}}
+  // We differentiate from components by checking if a matching component exists
+  var regex = /\{\{([a-z][a-z0-9]*(?:-[a-z0-9]+)+)\s/g;
+  var m;
+  var seen = {};
+  while ((m = regex.exec(hbsContent)) !== null) {
+    var name = m[1];
+    if (!seen[name]) {
+      seen[name] = true;
+      helpers.push(name);
+    }
+  }
+  return helpers;
+}
+
+/**
+ * Look up a service file path in both pods and classic layouts.
+ * Returns { path, content } or null.
+ */
+function readServiceFile(serviceName) {
+  // Pods: services/service-name.js or pods/services/service-name.js
+  // Classic: services/service-name.js
+  var candidates = [
+    'services/' + serviceName + '.js',
+    'pods/services/' + serviceName + '.js'
+  ];
+  for (var i = 0; i < candidates.length; i++) {
+    var fullPath = path.join(config.dir, candidates[i]);
+    if (fs.existsSync(fullPath)) {
+      try {
+        var content = fs.readFileSync(fullPath, 'utf-8');
+        if (content.length > 8000) content = content.substring(0, 8000) + '\n// ... truncated ...';
+        return { path: candidates[i], content: content };
+      } catch (e) { /* skip */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * Look up a mixin file path.
+ * Returns { path, content } or null.
+ */
+function readMixinFile(mixinName) {
+  var candidates = [
+    'mixins/' + mixinName + '.js',
+    'pods/mixins/' + mixinName + '.js'
+  ];
+  for (var i = 0; i < candidates.length; i++) {
+    var fullPath = path.join(config.dir, candidates[i]);
+    if (fs.existsSync(fullPath)) {
+      try {
+        var content = fs.readFileSync(fullPath, 'utf-8');
+        if (content.length > 6000) content = content.substring(0, 6000) + '\n// ... truncated ...';
+        return { path: candidates[i], content: content };
+      } catch (e) { /* skip */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * Look up a helper file path.
+ * Returns { path, content } or null.
+ */
+function readHelperFile(helperName) {
+  var candidates = [
+    'helpers/' + helperName + '.js',
+    'pods/helpers/' + helperName + '.js'
+  ];
+  for (var i = 0; i < candidates.length; i++) {
+    var fullPath = path.join(config.dir, candidates[i]);
+    if (fs.existsSync(fullPath)) {
+      try {
+        var content = fs.readFileSync(fullPath, 'utf-8');
+        if (content.length > 4000) content = content.substring(0, 4000) + '\n// ... truncated ...';
+        return { path: candidates[i], content: content };
+      } catch (e) { /* skip */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve all JS dependencies (services, mixins, helpers) from loaded components + route JS.
+ * Returns { services: [{path, content}], mixins: [{path, content}], helpers: [{path, content}] }
+ */
+function resolveJSDependencies(componentTemplates, routeJS) {
+  var allServices = {};
+  var allMixins = {};
+  var allHelpers = {};
+
+  // Extract from component JS files
+  if (componentTemplates) {
+    for (var ci = 0; ci < componentTemplates.length; ci++) {
+      var ct = componentTemplates[ci];
+      if (ct.jsContent) {
+        var deps = extractJSDependencies(ct.jsContent);
+        deps.services.forEach(function (s) { allServices[s] = true; });
+        deps.mixins.forEach(function (m) { allMixins[m] = true; });
+      }
+      // Extract helpers from component templates
+      if (ct.content) {
+        var helperRefs = extractHelperRefs(ct.content);
+        helperRefs.forEach(function (h) { allHelpers[h] = true; });
+      }
+    }
+  }
+
+  // Extract from route/controller JS files
+  if (routeJS) {
+    for (var ri = 0; ri < routeJS.length; ri++) {
+      if (routeJS[ri].content) {
+        var routeDeps = extractJSDependencies(routeJS[ri].content);
+        routeDeps.services.forEach(function (s) { allServices[s] = true; });
+        routeDeps.mixins.forEach(function (m) { allMixins[m] = true; });
+      }
+    }
+  }
+
+  // Resolve service files
+  var serviceFiles = [];
+  Object.keys(allServices).forEach(function (svcName) {
+    var svc = readServiceFile(svcName);
+    if (svc) serviceFiles.push(svc);
+  });
+
+  // Resolve mixin files
+  var mixinFiles = [];
+  Object.keys(allMixins).forEach(function (mixinName) {
+    var mixin = readMixinFile(mixinName);
+    if (mixin) mixinFiles.push(mixin);
+  });
+
+  // Resolve helper files (only ones that exist as actual helper files, not components)
+  var helperFiles = [];
+  Object.keys(allHelpers).forEach(function (helperName) {
+    var helper = readHelperFile(helperName);
+    if (helper) helperFiles.push(helper);
+  });
+
+  return {
+    services: serviceFiles,
+    mixins: mixinFiles,
+    helpers: helperFiles
+  };
+}
+
+/**
  * Read the route JS handler and controller for a route.
  * Supports both pods and classic:
  *   Pods:    pods/settings/integrations/connections/route.js + controller.js
@@ -1103,11 +1317,41 @@ function getTemplateContext(routePath) {
   var routeJS = readRouteJS(route.fullName);
   console.log('[agent]   Route/controller JS files:', routeJS.length);
 
+  // ── Resolve JS dependencies (services, mixins, helpers) from all loaded JS ──
+  var jsDeps = resolveJSDependencies(componentTemplates, routeJS);
+  console.log('[agent]   JS dependencies: services=' + jsDeps.services.length +
+    ', mixins=' + jsDeps.mixins.length + ', helpers=' + jsDeps.helpers.length);
+  if (jsDeps.services.length > 0) console.log('[agent]     Services:', jsDeps.services.map(function (s) { return s.path; }).join(', '));
+  if (jsDeps.mixins.length > 0) console.log('[agent]     Mixins:', jsDeps.mixins.map(function (m) { return m.path; }).join(', '));
+  if (jsDeps.helpers.length > 0) console.log('[agent]     Helpers:', jsDeps.helpers.map(function (h) { return h.path; }).join(', '));
+
+  // Also extract helpers from the main route template
+  var mainHelpers = [];
+  if (template) {
+    var mainHelperRefs = extractHelperRefs(template.content);
+    mainHelperRefs.forEach(function (h) {
+      var helper = readHelperFile(h);
+      if (helper) {
+        // Avoid duplicates
+        var alreadyIncluded = false;
+        for (var di = 0; di < jsDeps.helpers.length; di++) {
+          if (jsDeps.helpers[di].path === helper.path) { alreadyIncluded = true; break; }
+        }
+        if (!alreadyIncluded) mainHelpers.push(helper);
+      }
+    });
+  }
+  if (mainHelpers.length > 0) {
+    jsDeps.helpers = jsDeps.helpers.concat(mainHelpers);
+    console.log('[agent]     Main template helpers:', mainHelpers.map(function (h) { return h.path; }).join(', '));
+  }
+
   return {
     route: route,
     template: template,
     componentTemplates: componentTemplates,
     routeJS: routeJS,
+    dependencies: jsDeps,
     totalTemplates: (template ? 1 : 0) + componentTemplates.length,
     hasTemplate: !!template
   };

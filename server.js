@@ -743,6 +743,21 @@ function handleRequest(req, res) {
               lines.push('Description: ' + (bugDesc || 'No description'));
               lines.push('');
 
+              // Include structured QA data (page, steps, expected/actual) if available
+              if (_parsedDesc) {
+                lines.push('## Structured QA Report');
+                if (_parsedDesc.page) lines.push('**Page:** ' + _parsedDesc.page);
+                if (_parsedDesc.steps && _parsedDesc.steps.length > 0) {
+                  lines.push('**QA Reproduction Steps:**');
+                  for (var qi = 0; qi < _parsedDesc.steps.length; qi++) {
+                    lines.push((qi + 1) + '. ' + _parsedDesc.steps[qi]);
+                  }
+                }
+                if (_parsedDesc.expected) lines.push('**Expected:** ' + _parsedDesc.expected);
+                if (_parsedDesc.actual) lines.push('**Actual (bug):** ' + _parsedDesc.actual);
+                lines.push('');
+              }
+
               if (templateCtx.template) {
                 lines.push('## Page Template (HBS)');
                 lines.push('File: ' + templateCtx.template.path);
@@ -798,6 +813,15 @@ function handleRequest(req, res) {
               lines.push('For example, if the bug says placeholder shows "Search Service" instead of "Search Services",');
               lines.push('use: { "action": "assert", "selector": "input.search", "attribute": "placeholder", "expected": "Search Service", "description": "Bug: placeholder says Search Service" }');
               lines.push('The "expected" value should be the INCORRECT/BUGGY value from the bug report.');
+              if (_parsedDesc && _parsedDesc.actual) {
+                lines.push('');
+                lines.push('**For this specific bug:**');
+                lines.push('The QA reports the ACTUAL (buggy) behavior is: "' + _parsedDesc.actual + '"');
+                if (_parsedDesc.expected) {
+                  lines.push('The EXPECTED (correct) behavior should be: "' + _parsedDesc.expected + '"');
+                }
+                lines.push('Your assert "expected" field should match the BUGGY value (the "actual" above).');
+              }
               lines.push('');
               lines.push('Each step must be one of:');
               lines.push('- { "action": "click", "selector": "CSS selector", "description": "why" }');
@@ -990,6 +1014,7 @@ function handleRequest(req, res) {
             }
 
             // Step 0: Try browser reproduction (if agent is available)
+            // Supports retry: if first attempt fails/inconclusive, ask AI for corrected steps
             function attemptReproduction(callback) {
               if (!analyzeUser.agentUrl) {
                 return callback(null); // No agent — skip reproduction
@@ -1007,78 +1032,268 @@ function handleRequest(req, res) {
                   console.log('[STEP 5a] ℹ️ No interaction steps — observe-only mode');
                 }
 
-                agentProxy.playwrightGenerate(
-                  analyzeUser.agentUrl,
-                  analyzeMatch[1],
-                  bugData.bug.title || '',
-                  bugData.bug.description || '',
-                  devServerUrl,
-                  analyzeUser.testUsername || '',
-                  analyzeUser.testPassword || '',
-                  targetRoute,
-                  interactionSteps
-                ).then(function (genResult) {
-                  console.log('[STEP 5a] ✅ Reproduction script generated:', genResult.testFile);
-                  console.log('[STEP 5a] 🏃 Running reproduction script...');
-                  // Run the test
-                  agentProxy.playwrightRun(analyzeUser.agentUrl, genResult.testFile).then(function (runResult) {
-                    // Determine reproduction status from assertions + pass/fail
-                    var bugConfirmed = !!runResult.bugConfirmed;
-                    var assertions = runResult.assertions || [];
-                    var navigationOk = runResult.navigationOk !== false;
-                    var reproduced = bugConfirmed || !runResult.passed;
-                    var status = 'not-reproduced';
-                    if (bugConfirmed) {
-                      status = 'bug-confirmed';
-                      console.log('[STEP 5a] 🔴 Bug CONFIRMED by assertion(s)');
-                    } else if (!navigationOk) {
-                      status = 'navigation-failed';
-                      console.log('[STEP 5a] ⚠️ Navigation failed — test inconclusive');
-                      reproduced = false;
-                    } else if (!runResult.passed) {
-                      status = 'test-errors';
-                      console.log('[STEP 5a] ⚠️ Test had errors (may or may not indicate bug)');
-                    } else if (assertions.length > 0) {
-                      status = 'assertions-passed';
-                      console.log('[STEP 5a] ✅ Assertions ran — bug condition NOT found');
-                    } else {
-                      status = 'no-assertions';
-                      console.log('[STEP 5a] ℹ️ No assertions — test completed without verification');
-                    }
-                    console.log('[STEP 5a] Result — status:', status, 'passed:', runResult.passed, 'bugConfirmed:', bugConfirmed, 'duration:', runResult.duration + 'ms');
-                    callback({
-                      attempted: true,
-                      passed: runResult.passed,
-                      reproduced: reproduced,
-                      bugConfirmed: bugConfirmed,
-                      assertions: assertions,
-                      navigationOk: navigationOk,
-                      pageUrl: runResult.pageUrl || null,
-                      status: status,
-                      output: runResult.output,
-                      duration: runResult.duration,
-                      testFile: genResult.testFile,
-                      screenshotFile: runResult.screenshotFile,
-                      interactionSteps: interactionSteps.length
+                // Run the reproduction for a given set of steps and callback with result
+                function runReproduction(steps, label, doneCallback) {
+                  agentProxy.playwrightGenerate(
+                    analyzeUser.agentUrl,
+                    analyzeMatch[1],
+                    bugData.bug.title || '',
+                    bugData.bug.description || '',
+                    devServerUrl,
+                    analyzeUser.testUsername || '',
+                    analyzeUser.testPassword || '',
+                    targetRoute,
+                    steps
+                  ).then(function (genResult) {
+                    console.log('[' + label + '] ✅ Reproduction script generated:', genResult.testFile);
+                    console.log('[' + label + '] 🏃 Running reproduction script...');
+                    agentProxy.playwrightRun(analyzeUser.agentUrl, genResult.testFile).then(function (runResult) {
+                      var bugConfirmed = !!runResult.bugConfirmed;
+                      var assertions = runResult.assertions || [];
+                      var navigationOk = runResult.navigationOk !== false;
+                      var reproduced = bugConfirmed || !runResult.passed;
+                      var status = 'not-reproduced';
+                      if (bugConfirmed) {
+                        status = 'bug-confirmed';
+                        console.log('[' + label + '] 🔴 Bug CONFIRMED by assertion(s)');
+                      } else if (!navigationOk) {
+                        status = 'navigation-failed';
+                        console.log('[' + label + '] ⚠️ Navigation failed — test inconclusive');
+                        reproduced = false;
+                      } else if (!runResult.passed) {
+                        status = 'test-errors';
+                        console.log('[' + label + '] ⚠️ Test had errors (may or may not indicate bug)');
+                      } else if (assertions.length > 0) {
+                        status = 'assertions-passed';
+                        console.log('[' + label + '] ✅ Assertions ran — bug condition NOT found');
+                      } else {
+                        status = 'no-assertions';
+                        console.log('[' + label + '] ℹ️ No assertions — test completed without verification');
+                      }
+                      console.log('[' + label + '] Result — status:', status, 'passed:', runResult.passed, 'bugConfirmed:', bugConfirmed, 'duration:', runResult.duration + 'ms');
+                      doneCallback({
+                        attempted: true,
+                        passed: runResult.passed,
+                        reproduced: reproduced,
+                        bugConfirmed: bugConfirmed,
+                        assertions: assertions,
+                        navigationOk: navigationOk,
+                        pageUrl: runResult.pageUrl || null,
+                        status: status,
+                        output: runResult.output,
+                        duration: runResult.duration,
+                        testFile: genResult.testFile,
+                        screenshotFile: runResult.screenshotFile,
+                        interactionSteps: steps.length
+                      });
+                    }).catch(function (runErr) {
+                      console.log('[' + label + '] ⚠️ Reproduction run failed:', runErr.message);
+                      doneCallback({
+                        attempted: true,
+                        passed: false,
+                        reproduced: false,
+                        error: runErr.message,
+                        interactionSteps: steps.length
+                      });
                     });
-                  }).catch(function (runErr) {
-                    console.log('[STEP 5a] ⚠️ Reproduction run failed:', runErr.message);
-                    callback({
-                      attempted: true,
-                      passed: false,
-                      reproduced: false,
-                      error: runErr.message,
-                      interactionSteps: interactionSteps.length
+                  }).catch(function (genErr) {
+                    console.log('[' + label + '] ⚠️ Reproduction generate failed:', genErr.message);
+                    doneCallback({
+                      attempted: false,
+                      error: genErr.message
                     });
                   });
-                }).catch(function (genErr) {
-                  console.log('[STEP 5a] ⚠️ Reproduction generate failed:', genErr.message);
-                  callback({
-                    attempted: false,
-                    error: genErr.message
+                }
+
+                // ── First attempt ──
+                runReproduction(interactionSteps, 'STEP 5a', function (firstResult) {
+                  // Check if retry is warranted (navigation-failed, test-errors, or no-assertions)
+                  var shouldRetry = firstResult && firstResult.attempted &&
+                    !firstResult.bugConfirmed &&
+                    (firstResult.status === 'navigation-failed' || firstResult.status === 'test-errors' || firstResult.status === 'no-assertions') &&
+                    interactionSteps.length > 0;
+
+                  if (!shouldRetry) {
+                    return callback(firstResult);
+                  }
+
+                  // ── Retry: ask AI for corrected steps using first attempt's output ──
+                  console.log('');
+                  console.log('[STEP 5a-retry] 🔄 First reproduction attempt was', firstResult.status, '— asking AI for corrected steps...');
+
+                  var retryPromptLines = [];
+                  retryPromptLines.push('A Puppeteer browser reproduction test for a bug just ran but the result was: ' + firstResult.status + '.');
+                  retryPromptLines.push('');
+                  retryPromptLines.push('## Bug');
+                  retryPromptLines.push('Title: ' + (bugData.bug.title || ''));
+                  retryPromptLines.push('Description: ' + (bugData.bug.description || '').substring(0, 1500));
+                  retryPromptLines.push('');
+                  retryPromptLines.push('## Original Interaction Steps (that failed)');
+                  retryPromptLines.push('```json');
+                  retryPromptLines.push(JSON.stringify(interactionSteps, null, 2));
+                  retryPromptLines.push('```');
+                  retryPromptLines.push('');
+                  retryPromptLines.push('## Test Output');
+                  retryPromptLines.push('```');
+                  var retryOutput = (firstResult.output || '').substring(0, 3000);
+                  retryPromptLines.push(retryOutput);
+                  retryPromptLines.push('```');
+                  if (firstResult.pageUrl) retryPromptLines.push('Final page URL: ' + firstResult.pageUrl);
+                  retryPromptLines.push('');
+                  retryPromptLines.push('## Task');
+                  retryPromptLines.push('Based on the failure output above, generate CORRECTED interaction steps. Fix issues like:');
+                  retryPromptLines.push('- Wrong CSS selectors (element not found → use broader/different selector)');
+                  retryPromptLines.push('- Missing wait steps (element not yet rendered → add waitForSelector)');
+                  retryPromptLines.push('- Wrong page state (need to click/navigate somewhere first)');
+                  retryPromptLines.push('- Navigation errors (wrong route or URL)');
+                  retryPromptLines.push('');
+                  retryPromptLines.push('IMPORTANT: Include at least one "assert" step that checks for the buggy condition.');
+                  retryPromptLines.push('Return ONLY a valid JSON array of corrected steps. No markdown fences, no explanation.');
+
+                  var retryPromptText = retryPromptLines.join('\n');
+                  console.log('[STEP 5a-retry] Retry prompt:', retryPromptText.length, 'chars');
+
+                  // Send to AI for corrected steps
+                  var copilotBridge2 = require('./lib/copilot-bridge-client');
+                  copilotBridge2.checkHealth(function (hErr2, hData2) {
+                    function gotRetrySteps(retrySteps) {
+                      if (retrySteps && retrySteps.length > 0) {
+                        console.log('[STEP 5a-retry] ✅ Got', retrySteps.length, 'corrected steps — running retry...');
+                        retrySteps.forEach(function (s, idx) {
+                          console.log('[STEP 5a-retry]   Step', (idx + 1) + ':', s.action, s.selector || '', '-', s.description || '');
+                        });
+                        runReproduction(retrySteps, 'STEP 5a-retry', function (retryResult) {
+                          // Use the better result (prefer confirmed or assertions-passed)
+                          if (retryResult && retryResult.bugConfirmed) {
+                            console.log('[STEP 5a-retry] 🔴 Bug confirmed on retry!');
+                            retryResult.retried = true;
+                            return callback(retryResult);
+                          }
+                          if (retryResult && retryResult.status === 'assertions-passed') {
+                            console.log('[STEP 5a-retry] ✅ Assertions passed on retry');
+                            retryResult.retried = true;
+                            return callback(retryResult);
+                          }
+                          // Retry wasn't better — use first result
+                          console.log('[STEP 5a-retry] Retry result:', retryResult ? retryResult.status : 'failed', '— using first attempt result');
+                          firstResult.retryAttempted = true;
+                          callback(firstResult);
+                        });
+                      } else {
+                        console.log('[STEP 5a-retry] ⚠️ No corrected steps returned — using first attempt result');
+                        firstResult.retryAttempted = true;
+                        callback(firstResult);
+                      }
+                    }
+
+                    function tryRetryFallback() {
+                      var isClaude3 = githubAI.isClaudeModel(aiModel);
+                      var claudeKey3 = analyzeUser.claudeApiKey || '';
+                      var githubToken3 = analyzeUser.githubToken || '';
+                      if (isClaude3 && claudeKey3) {
+                        claudeClient.analyze(claudeKey3, retryPromptText, { model: aiModel }, function (err3, res3) {
+                          if (!err3 && res3 && res3.text) return gotRetrySteps(parseInteractionSteps(res3.text));
+                          firstResult.retryAttempted = true;
+                          callback(firstResult);
+                        });
+                      } else if (!isClaude3 && githubToken3) {
+                        githubAI.analyze(githubToken3, retryPromptText, { model: aiModel }, function (err3, res3) {
+                          if (!err3 && res3 && res3.text) return gotRetrySteps(parseInteractionSteps(res3.text));
+                          firstResult.retryAttempted = true;
+                          callback(firstResult);
+                        });
+                      } else {
+                        firstResult.retryAttempted = true;
+                        callback(firstResult);
+                      }
+                    }
+
+                    if (!hErr2 && hData2 && hData2.ok) {
+                      copilotBridge2.analyze(retryPromptText, aiModel, function (bErr2, bResult2) {
+                        if (!bErr2 && bResult2 && bResult2.text) {
+                          return gotRetrySteps(parseInteractionSteps(bResult2.text));
+                        }
+                        tryRetryFallback();
+                      });
+                    } else {
+                      tryRetryFallback();
+                    }
                   });
                 });
               });
+            }
+
+            // ── Build a "Reproduction Evidence" section to inject into the AI prompt ──
+            function buildReproductionEvidenceSection(repro) {
+              if (!repro || !repro.attempted) return '';
+              var lines = [];
+              lines.push('## 🧪 Reproduction Evidence (Automated Browser Test)');
+              lines.push('');
+              lines.push('> The following data was collected by running an automated Puppeteer browser test');
+              lines.push('> against the development server. Use this evidence to validate your analysis');
+              lines.push('> and focus on the confirmed bug behavior.');
+              lines.push('');
+              lines.push('**Reproduction Status:** ' + repro.status);
+              if (repro.bugConfirmed) {
+                lines.push('');
+                lines.push('⚠️ **BUG CONFIRMED** — the automated test found evidence matching the reported bug.');
+                lines.push('The assertions below matched the buggy condition. Your fix MUST address this confirmed behavior.');
+              } else if (repro.status === 'assertions-passed') {
+                lines.push('');
+                lines.push('✅ Assertions ran but the buggy condition was NOT found. The bug may be intermittent,');
+                lines.push('environment-specific, or already partially fixed. Still analyze the code for the root cause.');
+              } else if (repro.status === 'navigation-failed') {
+                lines.push('');
+                lines.push('⚠️ Navigation to the target page failed. The bug may involve routing or access issues.');
+              }
+              if (repro.pageUrl) {
+                lines.push('**Final Page URL:** `' + repro.pageUrl + '`');
+              }
+              lines.push('**Test Duration:** ' + (repro.duration || 0) + 'ms');
+              lines.push('');
+
+              // Detailed assertion results
+              if (repro.assertions && repro.assertions.length > 0) {
+                lines.push('### Assertion Results');
+                lines.push('');
+                for (var ai = 0; ai < repro.assertions.length; ai++) {
+                  var a = repro.assertions[ai];
+                  var statusTag = a.passed ? '✅ PASSED' : '❌ FAILED';
+                  if (a.status === 'element-not-found') statusTag = '⚠️ ELEMENT NOT FOUND';
+                  lines.push((ai + 1) + '. **' + statusTag + '** — ' + (a.description || 'assertion'));
+                  if (a.selector) lines.push('   - Selector: `' + a.selector + '`');
+                  if (a.attribute) lines.push('   - Attribute: `' + a.attribute + '`');
+                  if (a.expected !== undefined && a.expected !== null) lines.push('   - Expected (buggy value): `' + a.expected + '`');
+                  if (a.actual !== undefined && a.actual !== null) lines.push('   - Actual value found: `' + a.actual + '`');
+                  if (a.status === 'element-not-found') {
+                    lines.push('   - ⚠️ The element was not present on the page. The component may not be rendering or the selector is wrong.');
+                  }
+                }
+                lines.push('');
+              }
+
+              // Trimmed Puppeteer output (useful error messages, console logs)
+              if (repro.output) {
+                var outputLines = repro.output.split('\n');
+                // Filter for useful lines (skip blank and redundant lines)
+                var usefulLines = outputLines.filter(function (line) {
+                  var trimmed = line.trim();
+                  return trimmed.length > 0 && trimmed.indexOf('__REPRO_RESULT__') === -1;
+                });
+                if (usefulLines.length > 40) {
+                  usefulLines = usefulLines.slice(0, 40);
+                  usefulLines.push('... (output truncated)');
+                }
+                if (usefulLines.length > 0) {
+                  lines.push('### Browser Test Output');
+                  lines.push('```');
+                  lines.push(usefulLines.join('\n'));
+                  lines.push('```');
+                  lines.push('');
+                }
+              }
+
+              return lines.join('\n');
             }
 
             // Run reproduction first, then AI analysis
@@ -1102,6 +1317,45 @@ function handleRequest(req, res) {
                 fixSkipped: 'Bug was not reproduced — assertions verified the bug condition is not present. No code fix needed.',
                 reproduction: reproResult
               });
+            }
+
+            // ── Inject reproduction evidence into AI prompt (before sending to AI) ──
+            if (reproResult && reproResult.attempted) {
+              var reproEvidence = buildReproductionEvidenceSection(reproResult);
+              if (reproEvidence) {
+                // Insert the evidence BEFORE the "What You Must Do" section so AI prioritizes it
+                var taskMarker = '## What You Must Do';
+                var markerIdx = result.prompt.indexOf(taskMarker);
+                if (markerIdx > 0) {
+                  result.prompt = result.prompt.substring(0, markerIdx) + reproEvidence + '\n' + result.prompt.substring(markerIdx);
+                } else {
+                  // Fallback: append before coding standards
+                  result.prompt = result.prompt + '\n' + reproEvidence;
+                }
+                console.log('[STEP 5b] 📋 Injected reproduction evidence into AI prompt (' + reproEvidence.length + ' chars)');
+                console.log('  Updated prompt length:', result.prompt.length, 'chars');
+              }
+            }
+
+            // ── Inject reproduction screenshot into vision images ──
+            if (reproResult && reproResult.screenshotFile) {
+              try {
+                var reproScreenshotPath = require('path').join(__dirname, 'data', 'agent-data', 'prompts', reproResult.screenshotFile);
+                if (require('fs').existsSync(reproScreenshotPath)) {
+                  var screenshotData = require('fs').readFileSync(reproScreenshotPath);
+                  var screenshotBase64 = screenshotData.toString('base64');
+                  if (screenshotBase64.length < 5 * 1024 * 1024) { // under 5MB base64
+                    _bugImages.push({
+                      name: 'reproduction_screenshot.png',
+                      mimeType: 'image/png',
+                      base64: screenshotBase64
+                    });
+                    console.log('[STEP 5b] 📸 Added reproduction screenshot to vision images (' + Math.round(screenshotBase64.length / 1024) + ' KB)');
+                  }
+                }
+              } catch (ssErr) {
+                console.log('[STEP 5b] ⚠️ Could not read reproduction screenshot:', ssErr.message);
+              }
             }
 
             // Step 1: Try Copilot Bridge first (free, works for Claude + GPT-4o + more)
