@@ -70,6 +70,10 @@
   var settingDevServerUrl  = $('#setting-devServerUrl');
   var settingTestUsername   = $('#setting-testUsername');
   var settingTestPassword   = $('#setting-testPassword');
+  var targetRouteInput     = $('#target-route-input');
+  var autoDetectRouteBtn   = $('#auto-detect-route-btn');
+  var formatTemplateBtn    = $('#format-template-btn');
+  var routeSuggestions     = $('#route-suggestions');
   var claudeKeyGroup      = $('#claude-key-group');
   var githubTokenGroup    = $('#github-token-group');
   var discoverModelsBtn   = $('#discover-models-btn');
@@ -350,6 +354,8 @@
 
     // Bug detail split-view panel
     analyzeBtn.addEventListener('click', analyzeBug);
+    if (autoDetectRouteBtn) autoDetectRouteBtn.addEventListener('click', autoDetectRoute);
+    if (formatTemplateBtn) formatTemplateBtn.addEventListener('click', insertFormatTemplate);
     copyPromptBtn.addEventListener('click', copyPrompt);
     detailCloseBtn.addEventListener('click', closeSplitView);
 
@@ -577,6 +583,13 @@
     if (extraInput) {
       extraInput.value = extraDescCache[bugId] || '';
     }
+    // Clear and reset target route input
+    if (targetRouteInput) {
+      targetRouteInput.value = '';
+      targetRouteInput.placeholder = 'e.g. /settings/playbooks  (auto-detects if empty)';
+    }
+    // Load route suggestions from agent (once)
+    loadRouteSuggestions();
     modalDetails.innerHTML = '<div class="loading-text"><span class="spinner"></span> Loading bug details…</div>';
     modalTitle.textContent = 'Bug #' + String(bugId).slice(-6);
 
@@ -766,7 +779,8 @@
 
     var extraDesc = document.getElementById('extra-desc-input').value.trim();
     extraDescCache[currentBugId] = extraDesc;
-    var body = { extraDescription: extraDesc };
+    var routeVal = targetRouteInput ? targetRouteInput.value.trim() : '';
+    var body = { extraDescription: extraDesc, targetRoute: routeVal };
 
     apiPost('/api/bugs/' + currentBugId + '/analyze', body, function (status, data) {
       analyzeBtn.disabled = false;
@@ -835,6 +849,204 @@
     '</div>';
   }
 
+  // ── Route auto-detection and loading ──
+
+  var _routesLoaded = false;
+  var _routesList = [];
+
+  /**
+   * Load routes from agent for the datalist suggestions.
+   * Called once when the bug detail panel opens.
+   */
+  function loadRouteSuggestions() {
+    if (_routesLoaded || !routeSuggestions) return;
+    if (!currentUser || !currentUser.agentUrl) return;
+
+    // Use the agent's /routes endpoint
+    var agentUrl = currentUser.agentUrl.replace(/\/+$/, '');
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', agentUrl + '/routes', true);
+    xhr.timeout = 5000;
+    xhr.onload = function () {
+      if (xhr.status === 200) {
+        try {
+          var data = JSON.parse(xhr.responseText);
+          _routesList = data.routes || [];
+          _routesLoaded = true;
+          // Populate datalist
+          if (routeSuggestions && _routesList.length > 0) {
+            routeSuggestions.innerHTML = '';
+            _routesList.forEach(function (r) {
+              var opt = document.createElement('option');
+              opt.value = r.path;
+              opt.label = r.fullName + '  →  ' + r.displayPath;
+              routeSuggestions.appendChild(opt);
+            });
+          }
+        } catch (e) { /* ignore parse error */ }
+      }
+    };
+    xhr.onerror = function () {};
+    xhr.send();
+  }
+
+  /**
+   * Auto-detect the best matching route for the current bug.
+   */
+  function autoDetectRoute() {
+    if (!currentUser || !currentUser.agentUrl) {
+      if (targetRouteInput) targetRouteInput.placeholder = 'Agent not connected';
+      return;
+    }
+    if (!currentBugId) return;
+
+    // Find the bug title from detail section (rendered as styled div after "Title" heading)
+    var titleSections = document.querySelectorAll('.detail-section-title');
+    var bugTitle = '';
+    for (var tsi = 0; tsi < titleSections.length; tsi++) {
+      if (titleSections[tsi].textContent === 'Title') {
+        var nextEl = titleSections[tsi].nextElementSibling;
+        if (nextEl) bugTitle = nextEl.textContent || '';
+        break;
+      }
+    }
+    // Also get bug description from the bug-detail-grid
+    var descEl = document.querySelector('.detail-desc');
+    var bugDesc = descEl ? descEl.textContent : '';
+    // Get module from rendered detail (if available)
+    var moduleEl = document.querySelector('.fix-tag-module');
+    var bugModule = moduleEl ? moduleEl.textContent.trim() : '';
+    // Check extra description for structured Page: field
+    var extraInput = document.getElementById('extra-desc-input');
+    var extraText = extraInput ? extraInput.value : '';
+    var combinedDesc = bugDesc + (extraText ? '\n' + extraText : '');
+
+    var agentUrl = currentUser.agentUrl.replace(/\/+$/, '');
+    var url = agentUrl + '/routes/match?title=' + encodeURIComponent(bugTitle) +
+      '&description=' + encodeURIComponent(combinedDesc.substring(0, 2000)) +
+      '&module=' + encodeURIComponent(bugModule);
+
+    if (autoDetectRouteBtn) {
+      autoDetectRouteBtn.disabled = true;
+      autoDetectRouteBtn.innerHTML = '<span class="spinner-xs"></span>';
+    }
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.timeout = 5000;
+    xhr.onload = function () {
+      if (autoDetectRouteBtn) {
+        autoDetectRouteBtn.disabled = false;
+        autoDetectRouteBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg> Detect';
+      }
+      if (xhr.status === 200) {
+        try {
+          var data = JSON.parse(xhr.responseText);
+          if (data.matchedRoute && targetRouteInput) {
+            targetRouteInput.value = data.matchedRoute;
+            targetRouteInput.style.borderColor = '#66bb6a';
+            // Show detection method
+            var methodLabel = data.method || 'auto';
+            if (autoDetectRouteBtn) {
+              autoDetectRouteBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#66bb6a" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg> ' + methodLabel;
+              autoDetectRouteBtn.style.color = '#66bb6a';
+              autoDetectRouteBtn.style.borderColor = '#66bb6a';
+            }
+            setTimeout(function () {
+              targetRouteInput.style.borderColor = '';
+              if (autoDetectRouteBtn) {
+                autoDetectRouteBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg> Detect';
+                autoDetectRouteBtn.style.color = '';
+                autoDetectRouteBtn.style.borderColor = '';
+              }
+            }, 3000);
+          } else if (targetRouteInput) {
+            targetRouteInput.placeholder = 'No route match found — enter manually';
+            targetRouteInput.style.borderColor = '#ff9800';
+            setTimeout(function () {
+              targetRouteInput.style.borderColor = '';
+              targetRouteInput.placeholder = 'e.g. /settings/playbooks  (auto-detects if empty)';
+            }, 3000);
+          }
+        } catch (e) { /* ignore */ }
+      }
+    };
+    xhr.onerror = function () {
+      if (autoDetectRouteBtn) {
+        autoDetectRouteBtn.disabled = false;
+        autoDetectRouteBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg> Detect';
+      }
+    };
+    xhr.send();
+  }
+
+  /**
+   * Insert structured bug format template into extra description input.
+   */
+  function insertFormatTemplate() {
+    var input = document.getElementById('extra-desc-input');
+    if (!input) return;
+
+    var template = 'Page: \nSteps:\n1. \n2. \n3. \nExpected: \nActual: ';
+
+    // If input already has content, check if it already has the format
+    var current = input.value.trim();
+    if (current && current.match(/(?:^|\n)\s*page\s*:/i)) {
+      // Already has format — don't overwrite
+      input.focus();
+      return;
+    }
+
+    if (current) {
+      // Prepend template before existing content
+      input.value = template + '\n\n' + current;
+    } else {
+      input.value = template;
+    }
+
+    // Position cursor after "Page: "
+    input.focus();
+    input.setSelectionRange(6, 6);
+    input.rows = 7;
+    checkStructuredFormat();
+  }
+
+  /**
+   * Check if extra description has structured format and show visual indicator.
+   */
+  function checkStructuredFormat() {
+    var input = document.getElementById('extra-desc-input');
+    if (!input) return;
+    var text = input.value;
+    var hasPage = /(?:^|\n)\s*page\s*:\s*\S/i.test(text);
+    var hasSteps = /(?:^|\n)\s*steps\s*:/i.test(text);
+    var hasExpected = /(?:^|\n)\s*expected\s*:\s*\S/i.test(text);
+
+    if (hasPage || (hasSteps && hasExpected)) {
+      input.classList.add('structured-detected');
+      if (formatTemplateBtn) {
+        formatTemplateBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#66bb6a" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg> Structured';
+        formatTemplateBtn.style.color = '#66bb6a';
+        formatTemplateBtn.style.borderColor = '#66bb6a';
+      }
+    } else {
+      input.classList.remove('structured-detected');
+      if (formatTemplateBtn) {
+        formatTemplateBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg> Format';
+        formatTemplateBtn.style.color = '';
+        formatTemplateBtn.style.borderColor = '';
+      }
+    }
+  }
+
+  // Listen for typing in extra desc to detect format
+  (function () {
+    var input = document.getElementById('extra-desc-input');
+    if (input) {
+      input.addEventListener('input', checkStructuredFormat);
+    }
+  })();
+
   // Track files that have been applied (written to disk)
   var appliedDiffFiles = [];
   // Store parsed diffs for editing
@@ -868,17 +1080,70 @@
         reproBody += '<span class="repro-icon">\u23ED\uFE0F</span>';
         reproBody += '<span>Playwright reproduction skipped' + (repro.error ? ': ' + esc(repro.error) : '') + '</span>';
         reproBody += '</div>';
+      } else if (repro.bugConfirmed) {
+        // Assert steps confirmed the bug condition
+        reproBody += '<div class="repro-result repro-reproduced">';
+        reproBody += '<span class="repro-icon">\uD83D\uDD34</span>';
+        reproBody += '<span><strong>Bug Confirmed</strong> \u2014 Assertion verified the buggy behavior exists</span>';
+        reproBody += '</div>';
+        // Show assertion details
+        if (repro.assertions && repro.assertions.length > 0) {
+          reproBody += '<div class="repro-assertions">';
+          for (var ai = 0; ai < repro.assertions.length; ai++) {
+            var a = repro.assertions[ai];
+            var icon = a.matched ? '\uD83D\uDD34' : '\u2705';
+            reproBody += '<div class="repro-assert-item">';
+            reproBody += '<span>' + icon + ' Step ' + a.step + ': <code>' + esc(a.attribute || '') + '</code> = <code>' + esc(a.actual || '') + '</code>';
+            reproBody += (a.matched ? ' \u2014 matches bug condition' : ' \u2014 correct value') + '</span>';
+            reproBody += '</div>';
+          }
+          reproBody += '</div>';
+        }
       } else if (repro.reproduced) {
-        // Bug was reproduced (test failed = bug exists)
+        // Test failed with errors (legacy behavior)
         reproBody += '<div class="repro-result repro-reproduced">';
         reproBody += '<span class="repro-icon">\uD83D\uDD34</span>';
         reproBody += '<span><strong>Bug Reproduced</strong> \u2014 Playwright test confirmed the issue exists</span>';
         reproBody += '</div>';
-      } else {
-        // Test passed = bug not reproduced
-        // Status-aware messaging:
+      } else if (repro.status === 'navigation-failed') {
+        // Navigation didn't reach target page
+        reproBody += '<div class="repro-result repro-nav-failed">';
+        reproBody += '<span class="repro-icon">\u26a0\ufe0f</span>';
+        reproBody += '<span><strong>Navigation Failed</strong> \u2014 Could not reach the target page (may need login on dev server)</span>';
+        reproBody += '</div>';
+      } else if (repro.status === 'no-assertions') {
+        // Test ran but had no assertions
+        reproBody += '<div class="repro-result repro-inconclusive">';
+        reproBody += '<span class="repro-icon">\uD83D\uDFE1</span>';
+        reproBody += '<span><strong>Inconclusive</strong> \u2014 Test completed but had no verification assertions</span>';
+        reproBody += '</div>';
+      } else if (repro.assertions && repro.assertions.length > 0 && !repro.bugConfirmed) {
+        // Assertions ran but bug condition not found
         var isFixed = bugStatus === 'fixed' || bugStatus === 'closed' || bugStatus === 'to be tested';
         if (isFixed) {
+          reproBody += '<div class="repro-result repro-fixed">';
+          reproBody += '<span class="repro-icon">\u2705</span>';
+          reproBody += '<span><strong>Verified Fixed</strong> \u2014 Assertions show the bug is resolved</span>';
+        } else {
+          reproBody += '<div class="repro-result repro-not-reproduced">';
+          reproBody += '<span class="repro-icon">\u2705</span>';
+          reproBody += '<span><strong>Not Reproduced</strong> \u2014 Assertions checked but bug condition was not found</span>';
+        }
+        reproBody += '</div>';
+        // Show assertion details
+        reproBody += '<div class="repro-assertions">';
+        for (var ai2 = 0; ai2 < repro.assertions.length; ai2++) {
+          var a2 = repro.assertions[ai2];
+          reproBody += '<div class="repro-assert-item">';
+          reproBody += '<span>\u2705 Step ' + a2.step + ': <code>' + esc(a2.attribute || '') + '</code> = <code>' + esc(a2.actual || '') + '</code>';
+          reproBody += ' (expected buggy: <code>' + esc(a2.expected || '') + '</code>)</span>';
+          reproBody += '</div>';
+        }
+        reproBody += '</div>';
+      } else {
+        // Legacy: test passed, no assertions
+        var isFixed2 = bugStatus === 'fixed' || bugStatus === 'closed' || bugStatus === 'to be tested';
+        if (isFixed2) {
           reproBody += '<div class="repro-result repro-fixed">';
           reproBody += '<span class="repro-icon">\u2705</span>';
           reproBody += '<span><strong>Verified Fixed</strong> \u2014 Playwright test passed, the bug appears to be resolved</span>';
@@ -902,8 +1167,27 @@
       }
       reproBody += '</div>';
 
-      var reproBadge = repro.reproduced ? 'Reproduced' : (repro.attempted ? (bugStatus === 'fixed' || bugStatus === 'closed' || bugStatus === 'to be tested' ? 'Fixed' : 'Not Reproduced') : 'Skipped');
-      var reproBadgeColor = repro.reproduced ? 'red' : (repro.attempted ? 'green' : '');
+      var reproBadge, reproBadgeColor;
+      if (repro.bugConfirmed) {
+        reproBadge = 'Bug Confirmed';
+        reproBadgeColor = 'red';
+      } else if (repro.status === 'navigation-failed') {
+        reproBadge = 'Nav Failed';
+        reproBadgeColor = 'orange';
+      } else if (repro.status === 'no-assertions') {
+        reproBadge = 'Inconclusive';
+        reproBadgeColor = 'orange';
+      } else if (repro.reproduced) {
+        reproBadge = 'Reproduced';
+        reproBadgeColor = 'red';
+      } else if (repro.attempted) {
+        var isFix3 = bugStatus === 'fixed' || bugStatus === 'closed' || bugStatus === 'to be tested';
+        reproBadge = isFix3 ? 'Fixed' : 'Not Reproduced';
+        reproBadgeColor = 'green';
+      } else {
+        reproBadge = 'Skipped';
+        reproBadgeColor = '';
+      }
       html += makeAccordion('repro', '\uD83C\uDFAD', 'Reproduction', reproBadge, reproBody, { open: true, badgeColor: reproBadgeColor });
     }
 

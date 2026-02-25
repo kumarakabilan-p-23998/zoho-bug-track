@@ -325,14 +325,22 @@ function analyzeForBug(keywords) {
 var childProcess = require('child_process');
 
 // ── prompts data dir ─────────────────────────────────────
+// Store agent data OUTSIDE the Ember project to avoid triggering Broccoli/livereload.
+// Uses the zoho-bug-track tool's own directory instead.
 
-var PROMPTS_DIR = path.join(config.dir, '..', '.bug-tracker-data', 'prompts');
+var BUG_TRACKER_DATA_DIR = path.join(__dirname, 'data', 'agent-data');
+var PROMPTS_DIR = path.join(BUG_TRACKER_DATA_DIR, 'prompts');
 try {
-  if (!fs.existsSync(path.join(config.dir, '..', '.bug-tracker-data'))) {
-    fs.mkdirSync(path.join(config.dir, '..', '.bug-tracker-data'));
+  if (!fs.existsSync(BUG_TRACKER_DATA_DIR)) {
+    fs.mkdirSync(BUG_TRACKER_DATA_DIR);
   }
   if (!fs.existsSync(PROMPTS_DIR)) {
     fs.mkdirSync(PROMPTS_DIR);
+  }
+  // Ensure package.json exists so npm install works in this dir
+  var pkgFile = path.join(BUG_TRACKER_DATA_DIR, 'package.json');
+  if (!fs.existsSync(pkgFile)) {
+    fs.writeFileSync(pkgFile, '{}', 'utf-8');
   }
 } catch (e) { /* ignore — will fail at save time */ }
 
@@ -367,16 +375,20 @@ function findBrowserPath() {
  * Ensure puppeteer-core is installed. Runs npm install once if needed.
  * callback(err)
  */
-function ensurePuppeteer(callback) {
-  try {
-    require.resolve('puppeteer-core');
-    return callback(null); // already installed
-  } catch (e) { /* not found — install */ }
+function getPuppeteerCorePath() {
+  return path.join(BUG_TRACKER_DATA_DIR, 'node_modules', 'puppeteer-core');
+}
 
-  console.log('[agent] Installing puppeteer-core@2.1.1 (one-time)...');
-  var installDir = path.join(config.dir, '..');
+function ensurePuppeteer(callback) {
+  // Check if puppeteer-core is installed in our isolated .bug-tracker-data dir
+  var puppeteerPath = getPuppeteerCorePath();
+  if (fs.existsSync(puppeteerPath)) {
+    return callback(null); // already installed
+  }
+
+  console.log('[agent] Installing puppeteer-core@2.1.1 into .bug-tracker-data (one-time)...');
   childProcess.exec('npm install puppeteer-core@2.1.1 --no-save --no-package-lock', {
-    cwd: installDir,
+    cwd: BUG_TRACKER_DATA_DIR,
     timeout: 120000,
     maxBuffer: 2 * 1024 * 1024
   }, function (err, stdout, stderr) {
@@ -384,9 +396,721 @@ function ensurePuppeteer(callback) {
       console.log('[agent] puppeteer-core install failed:', (stderr || err.message));
       return callback(new Error('Failed to install puppeteer-core: ' + (stderr || err.message)));
     }
-    console.log('[agent] puppeteer-core installed successfully');
+    console.log('[agent] puppeteer-core installed to', BUG_TRACKER_DATA_DIR);
     callback(null);
   });
+}
+
+// ── Ember Route Parsing & Bug-to-Route Matching ──────────────
+
+/**
+ * Parse the Ember router.js file and extract a flat list of routes with their URL paths.
+ * Returns an array of { name, path, fullName } objects.
+ */
+function parseEmberRoutes() {
+  var routerFile = path.join(config.dir, '..', 'router.js');
+  // Try a few common locations
+  if (!fs.existsSync(routerFile)) {
+    routerFile = path.join(config.dir, 'router.js');
+  }
+  if (!fs.existsSync(routerFile)) {
+    // Search for it
+    var candidates = ['router.js', '../router.js', '../../router.js'];
+    for (var ci = 0; ci < candidates.length; ci++) {
+      var candidate = path.resolve(config.dir, candidates[ci]);
+      if (fs.existsSync(candidate)) { routerFile = candidate; break; }
+    }
+  }
+  if (!fs.existsSync(routerFile)) {
+    console.log('[agent] ⚠️ router.js not found near', config.dir);
+    return [];
+  }
+
+  var content = fs.readFileSync(routerFile, 'utf-8');
+  var routes = [];
+
+  // Regex-based parser for Ember router.js
+  // Tracks nesting via brace depth: update depth FIRST, then pop closed scopes,
+  // then process route declarations and push new scopes.
+  // This correctly handles { path: '...' } option objects (net-zero braces)
+  // and inline function callbacks on the same line as this.route().
+  var lines = content.split('\n');
+  var braceDepth = 0;
+  var routeDepths = []; // stack of { name, path, depth }
+
+  for (var li = 0; li < lines.length; li++) {
+    var line = lines[li];
+
+    // Strip single-line comments to avoid counting braces inside them
+    var codeLine = line.replace(/\/\/.*$/, '');
+    // Strip string contents to avoid counting braces inside strings
+    codeLine = codeLine.replace(/(["'])(?:(?!\1).)*\1/g, '""');
+
+    // Count brace changes on the cleaned line
+    var openBraces = (codeLine.match(/\{/g) || []).length;
+    var closeBraces = (codeLine.match(/\}/g) || []).length;
+
+    // ── 1. Update brace depth FIRST ──
+    braceDepth += openBraces - closeBraces;
+
+    // ── 2. Pop parent routes whose scope has closed ──
+    // Use strict < : a route pushed at depth N stays until braceDepth drops below N
+    while (routeDepths.length > 0 && braceDepth < routeDepths[routeDepths.length - 1].depth) {
+      routeDepths.pop();
+    }
+
+    // ── 3. Process route declarations ──
+    var routeMatch = line.match(/this\.route\s*\(\s*["']([^"']+)["']/);
+    if (routeMatch) {
+      var routeName = routeMatch[1];
+      var pathMatch = line.match(/path\s*:\s*["']([^"']+)["']/);
+      var routePath = pathMatch ? pathMatch[1] : '/' + routeName;
+      var hasCallback = /function\s*\(/.test(line);
+
+      // Build the full path from parent stack
+      var fullPath = '';
+      for (var pi = 0; pi < routeDepths.length; pi++) {
+        fullPath += routeDepths[pi].path;
+      }
+      // Only add leading slash if routePath doesn't start with one
+      if (routePath.charAt(0) !== '/') {
+        fullPath += '/' + routePath;
+      } else {
+        fullPath += routePath;
+      }
+
+      // Build full dot-separated name
+      var fullName = routeDepths.map(function (r) { return r.name; }).concat([routeName]).join('.');
+
+      // Clean up path — remove duplicate slashes
+      var cleanPath = fullPath.replace(/\/+/g, '/');
+
+      routes.push({
+        name: routeName,
+        fullName: fullName,
+        path: cleanPath,
+        displayPath: cleanPath.replace(/\/:[^/]+/g, '/*')  // show :params as *
+      });
+
+      // If this route has a callback (children), push onto depth stack
+      // depth = current braceDepth (already updated), which is the depth INSIDE the function body
+      if (hasCallback) {
+        routeDepths.push({ name: routeName, path: routePath.charAt(0) === '/' ? routePath : '/' + routeName, depth: braceDepth });
+      }
+    }
+  }
+
+  console.log('[agent] 📍 Parsed', routes.length, 'routes from', routerFile);
+  return routes;
+}
+
+// ── Structured Description Parser ─────────────────────
+
+// Stop-words: common words that appear everywhere but mean nothing for route matching
+var ROUTE_STOP_WORDS = [
+  'the', 'and', 'for', 'but', 'not', 'with', 'this', 'that', 'from', 'are',
+  'was', 'were', 'been', 'have', 'has', 'had', 'will', 'would', 'could',
+  'should', 'can', 'may', 'might', 'shall', 'does', 'did', 'bug', 'error',
+  'issue', 'problem', 'fix', 'click', 'button', 'page', 'when', 'after',
+  'before', 'then', 'also', 'just', 'only', 'some', 'all', 'any', 'get',
+  'set', 'add', 'new', 'old', 'try', 'use', 'see', 'show', 'hide', 'open',
+  'close', 'save', 'edit', 'delete', 'remove', 'update', 'create', 'load',
+  'display', 'appear', 'disappear', 'work', 'working', 'broken', 'expected',
+  'actual', 'result', 'instead', 'incorrect', 'correct', 'wrong', 'right',
+  'name', 'type', 'value', 'text', 'input', 'field', 'form', 'tab', 'modal',
+  'popup', 'dialog', 'dropdown', 'select', 'option', 'check', 'checkbox',
+  'radio', 'table', 'row', 'column', 'cell', 'list', 'item', 'data', 'user',
+  'admin', 'test', 'step', 'steps', 'navigate', 'navigation', 'refresh'
+];
+
+/**
+ * Parse structured bug description.
+ * Looks for: Page:, Steps:, Expected:, Actual:
+ * Returns { page, steps[], expected, actual } or null if format not detected.
+ */
+function parseStructuredDescription(description) {
+  if (!description) return null;
+  // Strip HTML tags (Zoho descriptions may contain HTML)
+  var text = description.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').trim();
+
+  var result = { page: '', steps: [], expected: '', actual: '' };
+  var found = false;
+
+  // Extract Page: field
+  var pageMatch = text.match(/(?:^|\n)\s*page\s*:\s*(.+)/i);
+  if (pageMatch) {
+    result.page = pageMatch[1].trim();
+    found = true;
+  }
+
+  // Extract Steps: block (numbered lines after "Steps:")
+  var stepsMatch = text.match(/(?:^|\n)\s*steps\s*:\s*\n?([\s\S]*?)(?=\n\s*(?:expected|actual)\s*:|$)/i);
+  if (stepsMatch) {
+    var stepsBlock = stepsMatch[1].trim();
+    var stepLines = stepsBlock.split(/\n/);
+    for (var si = 0; si < stepLines.length; si++) {
+      var line = stepLines[si].trim();
+      // Match numbered steps: "1. Do something" or "- Do something"
+      var stepText = line.replace(/^\d+[\.\)\-]\s*/, '').replace(/^[\-\*]\s*/, '').trim();
+      if (stepText.length > 2) {
+        result.steps.push(stepText);
+        found = true;
+      }
+    }
+  }
+
+  // Extract Expected:
+  var expectedMatch = text.match(/(?:^|\n)\s*expected\s*:\s*(.+)/i);
+  if (expectedMatch) {
+    result.expected = expectedMatch[1].trim();
+    found = true;
+  }
+
+  // Extract Actual:
+  var actualMatch = text.match(/(?:^|\n)\s*actual\s*:\s*(.+)/i);
+  if (actualMatch) {
+    result.actual = actualMatch[1].trim();
+    found = true;
+  }
+
+  if (!found) return null;
+  console.log('[agent] 📋 Parsed structured description:', JSON.stringify(result));
+  return result;
+}
+
+/**
+ * Extract route URLs from text (e.g. "#/settings/connections" or "/settings/connections").
+ * Returns first match or ''.
+ */
+function extractRouteUrl(text) {
+  if (!text) return '';
+  // Match #/path/to/route or standalone /path/to/route (at least 2 segments)
+  var urlMatch = text.match(/#\/([a-z][a-z0-9\-\/]+)/i);
+  if (urlMatch) return urlMatch[1];
+  // Also try bare /settings/... or /soar/... patterns
+  var bareMatch = text.match(/(?:^|\s)\/([a-z][a-z0-9\-]+(?:\/[a-z][a-z0-9\-]+)+)/i);
+  if (bareMatch) return bareMatch[1];
+  return '';
+}
+
+/**
+ * Fuzzy-match a plain English page name (e.g. "Connections", "SOAR > Playbooks")
+ * against known Ember routes. Returns { route, score } or null.
+ */
+function matchPageNameToRoute(pageName, routes) {
+  if (!pageName || !routes || routes.length === 0) return null;
+
+  // Normalize: "SOAR > Playbooks" → ["soar", "playbooks"]
+  var pageTokens = pageName.toLowerCase()
+    .replace(/>/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter(function (t) { return t.length > 1; });
+
+  if (pageTokens.length === 0) return null;
+
+  var bestScore = 0;
+  var bestRoute = null;
+
+  for (var ri = 0; ri < routes.length; ri++) {
+    var route = routes[ri];
+    var score = 0;
+
+    // Route parts: "settings.integrations.connections" → ["settings", "integrations", "connections"]
+    var routeParts = route.fullName.toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(/\s+/)
+      .filter(function (p) { return p.length > 1; });
+
+    // Also path parts: "/settings/integrations/connections" → same
+    var pathParts = route.path.toLowerCase()
+      .replace(/\/:[^/]+/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(/\s+/)
+      .filter(function (p) { return p.length > 1; });
+
+    var allParts = routeParts.concat(pathParts);
+
+    // Score: how many page tokens match route parts
+    var matchedTokens = 0;
+    for (var ti = 0; ti < pageTokens.length; ti++) {
+      for (var pi = 0; pi < allParts.length; pi++) {
+        if (pageTokens[ti] === allParts[pi]) {
+          score += 20;  // exact match — high confidence
+          matchedTokens++;
+          break;
+        } else if (allParts[pi].indexOf(pageTokens[ti]) === 0 || pageTokens[ti].indexOf(allParts[pi]) === 0) {
+          score += 10;  // prefix match (e.g. "connect" matches "connections")
+          matchedTokens++;
+          break;
+        }
+      }
+    }
+
+    // Bonus: if ALL page tokens matched, this is very likely the right route
+    if (matchedTokens === pageTokens.length && pageTokens.length > 0) {
+      score += 30;
+    }
+
+    // Bonus: prefer deeper/more specific routes ("connections" in path = better than top-level)
+    var lastPathPart = pathParts.length > 0 ? pathParts[pathParts.length - 1] : '';
+    for (var li = 0; li < pageTokens.length; li++) {
+      if (pageTokens[li] === lastPathPart) {
+        score += 15;  // page name matches the leaf route segment
+        break;
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestRoute = route;
+    }
+  }
+
+  if (bestScore < 15) return null;  // too weak
+  return { route: bestRoute, score: bestScore };
+}
+
+/**
+ * Match a Zoho module name (e.g. "SOAR", "Connections") to a route.
+ * Modules are curated by the team and usually map to a route section.
+ */
+function matchModuleToRoute(moduleName, routes) {
+  if (!moduleName) return null;
+  return matchPageNameToRoute(moduleName, routes);
+}
+
+/**
+ * Match bug title + description keywords against known routes.
+ * 4-layer cascading detection:
+ *   1. Parsed Page: field (highest confidence)
+ *   2. URL extraction from description (#/path/...)
+ *   3. Zoho module name
+ *   4. Improved keyword scoring (fallback)
+ * Returns { matchedRoute, method, parsedDesc } or { matchedRoute: '' }.
+ */
+function matchBugToRoute(bugTitle, bugDescription, routes, moduleName) {
+  if (!routes || routes.length === 0) return { matchedRoute: '', method: 'none', parsedDesc: null };
+
+  var fullText = ((bugTitle || '') + ' ' + (bugDescription || ''));
+
+  // ── Layer 1: Structured Page: field ──
+  var parsed = parseStructuredDescription(bugDescription);
+  if (parsed && parsed.page) {
+    console.log('[agent] 🎯 Layer 1: Parsed Page field:', parsed.page);
+    var pageResult = matchPageNameToRoute(parsed.page, routes);
+    if (pageResult) {
+      console.log('[agent] ✅ Layer 1 match:', pageResult.route.fullName, '→', pageResult.route.path, '(score:', pageResult.score + ')');
+      return { matchedRoute: pageResult.route.path, method: 'structured-page', score: pageResult.score, parsedDesc: parsed };
+    }
+  }
+
+  // ── Layer 2: URL extraction ──
+  var extractedUrl = extractRouteUrl(fullText);
+  if (extractedUrl) {
+    console.log('[agent] 🔗 Layer 2: Extracted URL:', extractedUrl);
+    // Try direct path match
+    for (var ui = 0; ui < routes.length; ui++) {
+      var rPath = normalizeRoutePath(routes[ui].path);
+      if (rPath && extractedUrl.indexOf(rPath) !== -1) {
+        console.log('[agent] ✅ Layer 2 match:', routes[ui].fullName, '→', routes[ui].path);
+        return { matchedRoute: routes[ui].path, method: 'url-extraction', score: 100, parsedDesc: parsed };
+      }
+    }
+    // Try partial match on URL segments
+    var urlResult = matchPageNameToRoute(extractedUrl.replace(/\//g, ' '), routes);
+    if (urlResult && urlResult.score >= 20) {
+      console.log('[agent] ✅ Layer 2 fuzzy match:', urlResult.route.fullName, '→', urlResult.route.path);
+      return { matchedRoute: urlResult.route.path, method: 'url-extraction', score: urlResult.score, parsedDesc: parsed };
+    }
+  }
+
+  // ── Layer 3: Zoho module name ──
+  if (moduleName) {
+    console.log('[agent] 📦 Layer 3: Zoho module:', moduleName);
+    var modResult = matchModuleToRoute(moduleName, routes);
+    if (modResult) {
+      console.log('[agent] ✅ Layer 3 match:', modResult.route.fullName, '→', modResult.route.path, '(score:', modResult.score + ')');
+      return { matchedRoute: modResult.route.path, method: 'zoho-module', score: modResult.score, parsedDesc: parsed };
+    }
+  }
+
+  // ── Layer 4: Improved keyword scoring (fallback) ──
+  console.log('[agent] 🔤 Layer 4: Keyword scoring fallback');
+  var text = fullText.toLowerCase();
+
+  // Tokenize with stop-word filtering
+  var tokens = text
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter(function (t) {
+      return t.length > 2 && ROUTE_STOP_WORDS.indexOf(t) === -1;
+    });
+
+  // Weight title tokens 3x higher
+  var titleTokens = (bugTitle || '').toLowerCase()
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter(function (t) {
+      return t.length > 2 && ROUTE_STOP_WORDS.indexOf(t) === -1;
+    });
+
+  var bestScore = 0;
+  var bestRoute = null;
+
+  for (var ri = 0; ri < routes.length; ri++) {
+    var route = routes[ri];
+    var score = 0;
+
+    var nameParts = route.fullName.toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(/\s+/)
+      .filter(function (p) { return p.length > 2; });
+
+    var pathParts = route.path.toLowerCase()
+      .replace(/\/:[^/]+/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(/\s+/)
+      .filter(function (p) { return p.length > 2; });
+
+    var allParts = nameParts.concat(pathParts);
+
+    // Whole-word matching only (no partial indexOf)
+    for (var api = 0; api < allParts.length; api++) {
+      for (var ti = 0; ti < tokens.length; ti++) {
+        if (tokens[ti] === allParts[api]) {
+          // Title tokens worth 3x
+          var isTitleToken = titleTokens.indexOf(tokens[ti]) !== -1;
+          score += isTitleToken ? 15 : 5;
+        }
+      }
+    }
+
+    // Bonus for route name appearing in title
+    var titleLower = (bugTitle || '').toLowerCase();
+    if (route.name.length > 2 && titleLower.indexOf(route.name.toLowerCase()) !== -1) {
+      score += 20;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestRoute = route;
+    }
+  }
+
+  // Higher minimum score to avoid false positives
+  if (bestScore < 15) {
+    console.log('[agent] ⚠️ No confident route match (best score:', bestScore + ')');
+    return { matchedRoute: '', method: 'keyword-low-confidence', score: bestScore, parsedDesc: parsed };
+  }
+
+  console.log('[agent] 📍 Layer 4 match:', bestRoute.fullName, '→', bestRoute.path, '(score:', bestScore + ')');
+  return { matchedRoute: bestRoute.path, method: 'keyword', score: bestScore, parsedDesc: parsed };
+}
+
+// Cache parsed routes (re-parse every 5 minutes)
+var _cachedRoutes = null;
+var _routesCacheTime = 0;
+function getCachedRoutes() {
+  var now = Date.now();
+  if (!_cachedRoutes || (now - _routesCacheTime) > 5 * 60 * 1000) {
+    _cachedRoutes = parseEmberRoutes();
+    _routesCacheTime = now;
+  }
+  return _cachedRoutes;
+}
+
+// ── Layer 2: Template Resolution & Interaction Steps ─────
+
+/**
+ * Normalize a route path — strip hash prefix, leading/trailing slashes.
+ * "#/settings/integrations/connections" → "settings/integrations/connections"
+ */
+function normalizeRoutePath(routePath) {
+  if (!routePath) return '';
+  var p = routePath.replace(/^#?\/?/, '').replace(/\/+$/, '');
+  return p;
+}
+
+/**
+ * Given a route path (e.g. "/settings/playbooks" or "#/settings/integrations/connections"),
+ * find the matching route object.
+ */
+function findRouteByPath(routePath) {
+  var routes = getCachedRoutes();
+  if (!routePath) return null;
+  var normalized = '/' + normalizeRoutePath(routePath);
+
+  for (var i = 0; i < routes.length; i++) {
+    var rp = routes[i].path.replace(/\/+$/, '');
+    if (rp === normalized) return routes[i];
+  }
+  // Try without leading slash
+  var noSlash = normalized.replace(/^\//, '');
+  for (var j = 0; j < routes.length; j++) {
+    if (routes[j].path.replace(/^\//, '').replace(/\/+$/, '') === noSlash) return routes[j];
+  }
+  return null;
+}
+
+/**
+ * Convert a route path to its template file path.
+ * Supports both pods and classic Ember layouts:
+ *   Pods:    "#/settings/integrations/connections" → pods/settings/integrations/connections/template.hbs
+ *   Classic: "settings.playbooks" → templates/settings/playbooks.hbs
+ */
+function getTemplateForRoute(routeFullName) {
+  if (!routeFullName) return null;
+  var parts = routeFullName.replace(/\./g, '/');
+
+  // ── Pods layout (primary — used by this project) ──
+  // pods/{route-segments}/template.hbs
+  var podsRel = 'pods/' + parts + '/template.hbs';
+  var podsPath = path.join(config.dir, podsRel);
+  if (fs.existsSync(podsPath)) {
+    try {
+      return { path: podsRel, content: fs.readFileSync(podsPath, 'utf-8') };
+    } catch (e) { /* skip */ }
+  }
+
+  // ── Classic layout (fallback) ──
+  // templates/{route-segments}.hbs
+  var classicRel = 'templates/' + parts + '.hbs';
+  var classicPath = path.join(config.dir, classicRel);
+  if (fs.existsSync(classicPath)) {
+    try {
+      return { path: classicRel, content: fs.readFileSync(classicPath, 'utf-8') };
+    } catch (e) { /* skip */ }
+  }
+  // Classic index
+  var classicIndexRel = 'templates/' + parts + '/index.hbs';
+  var classicIndexPath = path.join(config.dir, classicIndexRel);
+  if (fs.existsSync(classicIndexPath)) {
+    try {
+      return { path: classicIndexRel, content: fs.readFileSync(classicIndexPath, 'utf-8') };
+    } catch (e) { /* skip */ }
+  }
+  return null;
+}
+
+/**
+ * Extract component references from HBS content.
+ * Matches both:
+ *   {{component-name ...}}           — simple hyphenated names
+ *   {{namespace/component-name ...}} — namespaced (pods-style) components
+ *   {{#component-name ...}}          — block form
+ */
+function extractComponentRefs(hbsContent) {
+  if (!hbsContent) return [];
+  var components = {};
+  // Match {{component-name}}, {{namespace/component-name}}, {{#component-name}}
+  // Component names contain at least one hyphen OR are namespaced with /
+  var regex = /\{\{#?((?:[a-z][a-z0-9]*(?:-[a-z0-9]+)*\/)*[a-z][a-z0-9]*(?:-[a-z0-9]+)+)/g;
+  var match;
+  while ((match = regex.exec(hbsContent)) !== null) {
+    var name = match[1];
+    // Skip built-in helpers
+    var builtins = ['link-to', 'query-params', 'each-in', 'ember-wormhole',
+      'liquid-if', 'liquid-unless', 'bs-tooltip', 'ember-popper',
+      'moment-format', 'is-equal', 't-translation', 'ads-i18n',
+      'ads-status-box', 'ads-dialog-box', 'ads-multi-section-filter',
+      'ads-notification-template', 'insert-newline'];
+    // Check base name (last segment after /) against builtins
+    var baseName = name.indexOf('/') !== -1 ? name.split('/').pop() : name;
+    if (builtins.indexOf(baseName) !== -1 || builtins.indexOf(name) !== -1) {
+      continue;
+    }
+    components[name] = true;
+  }
+  return Object.keys(components);
+}
+
+/**
+ * Read a single component's template + JS from pods or classic layout.
+ *
+ * Pod component paths:
+ *   "connections/connections-home" → pods/components/connections/connections-home/template.hbs
+ *   "show-cards"                  → pods/components/show-cards/template.hbs
+ *
+ * Classic component paths:
+ *   "connections/connections-home" → templates/components/connections/connections-home.hbs
+ *   "show-cards"                  → templates/components/show-cards.hbs
+ */
+function readOneComponent(name) {
+  var result = { name: name, path: null, content: null, jsPath: null, jsContent: null };
+
+  // ── Pods layout ──
+  var podsTemplateRel = 'pods/components/' + name + '/template.hbs';
+  var podsTemplatePath = path.join(config.dir, podsTemplateRel);
+  if (fs.existsSync(podsTemplatePath)) {
+    try {
+      result.path = podsTemplateRel;
+      result.content = fs.readFileSync(podsTemplatePath, 'utf-8');
+    } catch (e) { /* skip */ }
+  }
+
+  // Pods component JS
+  var podsJsRel = 'pods/components/' + name + '/component.js';
+  var podsJsPath = path.join(config.dir, podsJsRel);
+  if (fs.existsSync(podsJsPath)) {
+    try {
+      var jsContent = fs.readFileSync(podsJsPath, 'utf-8');
+      if (jsContent.length > 6000) jsContent = jsContent.substring(0, 6000) + '\n// ... truncated ...';
+      result.jsPath = podsJsRel;
+      result.jsContent = jsContent;
+    } catch (e) { /* skip */ }
+  }
+
+  // ── Classic layout fallback ──
+  if (!result.content) {
+    var classicRel = 'templates/components/' + name + '.hbs';
+    var classicPath = path.join(config.dir, classicRel);
+    if (fs.existsSync(classicPath)) {
+      try {
+        result.path = classicRel;
+        result.content = fs.readFileSync(classicPath, 'utf-8');
+      } catch (e) { /* skip */ }
+    }
+  }
+  if (!result.jsContent) {
+    var classicJsRel = 'components/' + name + '.js';
+    var classicJsPath = path.join(config.dir, classicJsRel);
+    if (fs.existsSync(classicJsPath)) {
+      try {
+        var jsC = fs.readFileSync(classicJsPath, 'utf-8');
+        if (jsC.length > 6000) jsC = jsC.substring(0, 6000) + '\n// ... truncated ...';
+        result.jsPath = classicJsRel;
+        result.jsContent = jsC;
+      } catch (e) { /* skip */ }
+    }
+  }
+
+  return result.content ? result : null;
+}
+
+/**
+ * Read component templates (and optional JS) for a list of component names.
+ */
+function readComponentTemplates(componentNames) {
+  var results = [];
+  for (var i = 0; i < componentNames.length; i++) {
+    var comp = readOneComponent(componentNames[i]);
+    if (comp) results.push(comp);
+  }
+  return results;
+}
+
+/**
+ * Read the route JS handler and controller for a route.
+ * Supports both pods and classic:
+ *   Pods:    pods/settings/integrations/connections/route.js + controller.js
+ *   Classic: routes/settings/integrations/connections.js + controllers/...
+ */
+function readRouteJS(routeFullName) {
+  if (!routeFullName) return [];
+  var parts = routeFullName.replace(/\./g, '/');
+  var files = [];
+
+  // ── Pods layout ──
+  var podCandidates = [
+    { type: 'route', rel: 'pods/' + parts + '/route.js' },
+    { type: 'controller', rel: 'pods/' + parts + '/controller.js' }
+  ];
+
+  // ── Classic layout ──
+  var classicCandidates = [
+    { type: 'route', rel: 'routes/' + parts + '.js' },
+    { type: 'controller', rel: 'controllers/' + parts + '.js' }
+  ];
+
+  var allCandidates = podCandidates.concat(classicCandidates);
+  for (var i = 0; i < allCandidates.length; i++) {
+    var fullPath = path.join(config.dir, allCandidates[i].rel);
+    if (fs.existsSync(fullPath)) {
+      try {
+        var content = fs.readFileSync(fullPath, 'utf-8');
+        if (content.length > 8000) content = content.substring(0, 8000) + '\n// ... truncated ...';
+        files.push({ type: allCandidates[i].type, path: allCandidates[i].rel, content: content });
+      } catch (e) { /* skip */ }
+    }
+  }
+  return files;
+}
+
+/**
+ * Get full template context for a route path.
+ * Returns HBS + component templates + route/controller JS.
+ * Supports pods layout: pods/{route}/template.hbs, pods/components/{name}/template.hbs
+ *
+ * Used by server.js to build AI prompt for interaction steps.
+ */
+function getTemplateContext(routePath) {
+  // Strip hash prefix (#/) and normalize
+  var cleanPath = normalizeRoutePath(routePath);
+
+  // Find route by path
+  var route = findRouteByPath(cleanPath);
+  if (!route) {
+    // Treat cleaned path segments as a dot-separated fullName
+    var guessFullName = cleanPath.replace(/\//g, '.');
+    route = { fullName: guessFullName, path: '/' + cleanPath, name: guessFullName.split('.').pop() };
+  }
+
+  console.log('[agent] Layer 2 — getTemplateContext for route:', route.fullName, '(' + route.path + ')');
+
+  var template = getTemplateForRoute(route.fullName);
+  if (template) {
+    console.log('[agent]   ✅ Template found:', template.path, '(' + template.content.length + ' chars)');
+  } else {
+    console.log('[agent]   ⚠️ No template found for', route.fullName);
+  }
+
+  // Extract component references from main template
+  var componentNames = template ? extractComponentRefs(template.content) : [];
+  console.log('[agent]   Components in template:', componentNames.length, componentNames.length > 0 ? componentNames.join(', ') : '');
+
+  var componentTemplates = readComponentTemplates(componentNames);
+  console.log('[agent]   Component templates loaded:', componentTemplates.length);
+
+  // Also extract 1-level-deep nested components from loaded component templates
+  var allKnown = {};
+  componentNames.forEach(function (n) { allKnown[n] = true; });
+  var nestedNames = [];
+  componentTemplates.forEach(function (ct) {
+    var nested = extractComponentRefs(ct.content);
+    nested.forEach(function (n) {
+      if (!allKnown[n]) {
+        allKnown[n] = true;
+        nestedNames.push(n);
+      }
+    });
+  });
+  if (nestedNames.length > 0) {
+    console.log('[agent]   Nested components (depth 2):', nestedNames.join(', '));
+    var nestedTemplates = readComponentTemplates(nestedNames);
+    componentTemplates = componentTemplates.concat(nestedTemplates);
+    console.log('[agent]   Nested templates loaded:', nestedTemplates.length);
+  }
+
+  // Limit total component templates to avoid huge prompts
+  if (componentTemplates.length > 15) {
+    console.log('[agent]   Limiting to 15 component templates (had', componentTemplates.length + ')');
+    componentTemplates = componentTemplates.slice(0, 15);
+  }
+
+  var routeJS = readRouteJS(route.fullName);
+  console.log('[agent]   Route/controller JS files:', routeJS.length);
+
+  return {
+    route: route,
+    template: template,
+    componentTemplates: componentTemplates,
+    routeJS: routeJS,
+    totalTemplates: (template ? 1 : 0) + componentTemplates.length,
+    hasTemplate: !!template
+  };
 }
 
 /**
@@ -394,11 +1118,26 @@ function ensurePuppeteer(callback) {
  * Uses puppeteer-core + locally installed Chrome/Edge.
  * Returns { testCode, testFile } or { error }.
  */
-function generateReproScript(bugId, bugTitle, bugDescription, devServerUrl, testUsername, testPassword) {
+function generateReproScript(bugId, bugTitle, bugDescription, devServerUrl, testUsername, testPassword, targetRoute, interactionSteps) {
   var testFile = path.join(PROMPTS_DIR, 'bug_' + bugId + '_repro.js');
   var baseUrl = devServerUrl || 'https://localhost:4200';
   var screenshotPath = path.join(PROMPTS_DIR, 'bug_' + bugId + '_screenshot.png').replace(/\\/g, '/');
   var browserPath = findBrowserPath();
+  interactionSteps = interactionSteps || [];
+
+  // Auto-detect target route from bug keywords if not manually specified
+  if (!targetRoute) {
+    var routes = getCachedRoutes();
+    targetRoute = matchBugToRoute(bugTitle, bugDescription, routes);
+  }
+  // Clean the route — ensure it starts with / and remove any leading BASE_URL
+  if (targetRoute) {
+    targetRoute = targetRoute.replace(/^https?:\/\/[^/]+/, '');  // strip origin if full URL
+    if (targetRoute.charAt(0) !== '/') targetRoute = '/' + targetRoute;
+    // Remove dynamic segments like :tab_id  — replace with sensible defaults
+    targetRoute = targetRoute.replace(/\/:[^/]+/g, '');
+    console.log('[agent] 📍 Target route for reproduction:', targetRoute);
+  }
 
   if (!browserPath) {
     return { error: 'No Chrome or Edge browser found. Set CHROME_PATH environment variable.' };
@@ -408,14 +1147,15 @@ function generateReproScript(bugId, bugTitle, bugDescription, devServerUrl, test
   L.push('// Auto-generated reproduction script for Bug: ' + (bugTitle || bugId));
   L.push('// Generated: ' + new Date().toISOString());
   L.push('// Uses puppeteer-core with local Chrome/Edge — Node 8+ compatible');
-  L.push('var puppeteer = require("puppeteer-core");');
+  L.push('var puppeteer = require(' + JSON.stringify(getPuppeteerCorePath().replace(/\\/g, '/')) + ');');
   L.push('');
   L.push('var BROWSER_PATH = ' + JSON.stringify(browserPath) + ';');
   L.push('var BASE_URL = ' + JSON.stringify(baseUrl) + ';');
+  L.push('var TARGET_ROUTE = ' + JSON.stringify(targetRoute || '') + ';  // Route to navigate after login');
   L.push('var SCREENSHOT = ' + JSON.stringify(screenshotPath) + ';');
   L.push('');
   L.push('function run() {');
-  L.push('  var result = { passed: false, errors: [], title: "", pageUrl: "" };');
+  L.push('  var result = { passed: false, errors: [], assertions: [], title: "", pageUrl: "", navigationOk: false };');
   L.push('  var browser;');
   L.push('');
   L.push('  return puppeteer.launch({');
@@ -434,7 +1174,8 @@ function generateReproScript(bugId, bugTitle, bugDescription, devServerUrl, test
   // ── Login step ──
   if (testUsername && testPassword) {
     L.push('    // ── Step 1: Login ──');
-    L.push('    return page.goto(BASE_URL, { waitUntil: "networkidle0", timeout: 30000 })');
+    L.push('    // Use networkidle2 (allows 2 outstanding connections) — SSO pages keep background requests alive');
+    L.push('    return page.goto(BASE_URL, { waitUntil: "networkidle2", timeout: 60000 })');
     L.push('    .then(function () {');
     L.push('      // Page may redirect to SSO/login — wait for it to settle');
     L.push('      return new Promise(function (r) { setTimeout(r, 3000); });');
@@ -446,46 +1187,55 @@ function generateReproScript(bugId, bugTitle, bugDescription, devServerUrl, test
     L.push('    .then(function () {');
     L.push('      // Log current URL (may have redirected to SSO)');
     L.push('      console.log("Login page URL: " + page.url());');
-    L.push('      // Wait for ANY input field to appear on the page');
-    L.push('      return page.waitForSelector("input", { visible: true, timeout: 20000 });');
-    L.push('    })');
-    L.push('    .then(function () {');
-    L.push('      // Try selectors in priority order using waitForSelector');
-    L.push('      var selectors = [');
+    L.push('      // Wait for the Zoho SSO login field specifically (id=login_id)');
+    L.push('      // Do NOT use generic "input" with visible:true — the SSO page has many hidden inputs');
+    L.push('      // that confuse Puppeteer visibility checks');
+    L.push('      var loginSelectors = [');
     L.push('        "#login_id",');
     L.push('        "#userid",');
     L.push('        "input[name=LOGIN_ID]",');
     L.push('        "input[name=login_id]",');
     L.push('        "input[type=email]",');
-    L.push('        "input[name*=user]",');
-    L.push('        "input[name*=login]",');
-    L.push('        "input[name*=email]",');
-    L.push('        "input[id*=user]",');
-    L.push('        "input[id*=login]",');
-    L.push('        "input[id*=email]",');
-    L.push('        "input[type=text]"');
+    L.push('        "input[type=text]:not([style*=\\"display: none\\"])"');
     L.push('      ];');
-    L.push('      // Try each selector — return the first match');
-    L.push('      function tryNext(i) {');
-    L.push('        if (i >= selectors.length) return Promise.resolve(null);');
-    L.push('        return page.$(selectors[i]).then(function (el) {');
-    L.push('          if (el) { console.log("Found username field: " + selectors[i]); return el; }');
-    L.push('          return tryNext(i + 1);');
+    L.push('      // Poll for any of these selectors to appear (check every 500ms, up to 30s)');
+    L.push('      var attempts = 0;');
+    L.push('      var maxAttempts = 60;');
+    L.push('      function pollForLogin() {');
+    L.push('        function trySelector(i) {');
+    L.push('          if (i >= loginSelectors.length) return Promise.resolve(null);');
+    L.push('          return page.$(loginSelectors[i]).then(function (el) {');
+    L.push('            if (el) return { el: el, selector: loginSelectors[i] };');
+    L.push('            return trySelector(i + 1);');
+    L.push('          });');
+    L.push('        }');
+    L.push('        return trySelector(0).then(function (found) {');
+    L.push('          if (found) return found;');
+    L.push('          attempts++;');
+    L.push('          if (attempts >= maxAttempts) return null;');
+    L.push('          return new Promise(function (r) { setTimeout(r, 500); }).then(pollForLogin);');
     L.push('        });');
     L.push('      }');
-    L.push('      return tryNext(0);');
+    L.push('      return pollForLogin();');
     L.push('    })');
-    L.push('    .then(function (usernameEl) {');
-    L.push('      if (!usernameEl) {');
-    L.push('        // Last resort: dump all input elements for debugging');
+    L.push('    .then(function (found) {');
+    L.push('      if (!found) {');
+    L.push('        // Dump all input elements for debugging');
     L.push('        return page.$$eval("input", function (inputs) {');
-    L.push('          return inputs.map(function (i) { return { tag: i.tagName, type: i.type, id: i.id, name: i.name, class: i.className }; });');
+    L.push('          return inputs.map(function (i) {');
+    L.push('            var rect = i.getBoundingClientRect();');
+    L.push('            return { id: i.id, name: i.name, type: i.type, class: i.className,');
+    L.push('              visible: rect.width > 0 && rect.height > 0,');
+    L.push('              display: window.getComputedStyle(i).display,');
+    L.push('              visibility: window.getComputedStyle(i).visibility };');
+    L.push('          });');
     L.push('        }).then(function (info) {');
-    L.push('          console.log("All inputs on page: " + JSON.stringify(info));');
-    L.push('          throw new Error("Could not find username field. Inputs found: " + JSON.stringify(info));');
+    L.push('          console.log("All inputs on page: " + JSON.stringify(info, null, 2));');
+    L.push('          throw new Error("Could not find login field after 30s. URL: " + page.url());');
     L.push('        });');
     L.push('      }');
-    L.push('      return usernameEl.click({ clickCount: 3 }).then(function () {');
+    L.push('      console.log("Found username field: " + found.selector);');
+    L.push('      return found.el.click({ clickCount: 3 }).then(function () {');
     L.push('        return page.keyboard.type(' + JSON.stringify(testUsername) + ');');
     L.push('      });');
     L.push('    })');
@@ -510,16 +1260,25 @@ function generateReproScript(bugId, bugTitle, bugDescription, devServerUrl, test
     L.push('    })');
     L.push('    .then(function () {');
     L.push('      // Wait for page to transition (password step or dashboard)');
-    L.push('      return new Promise(function (r) { setTimeout(r, 3000); });');
+    L.push('      return new Promise(function (r) { setTimeout(r, 4000); });');
     L.push('    })');
     L.push('    .then(function () {');
-    L.push('      // Check if password field appeared (two-step login)');
-    L.push('      return page.$("input[type=password]");');
+    L.push('      // Check if password field appeared (two-step login) — poll for it');
+    L.push('      return page.waitForSelector("#password, input[type=password]", { timeout: 10000 }).catch(function () { return null; });');
     L.push('    })');
     L.push('    .then(function (pwEl) {');
     L.push('      if (!pwEl) {');
-    L.push('        // Maybe password was already on the page or we are logged in');
-    L.push('        console.log("No password field found — may already be logged in");');
+    L.push('        // Try one more direct check');
+    L.push('        return page.$("#password").then(function (el) {');
+    L.push('          if (el) return el;');
+    L.push('          return page.$("input[type=password]");');
+    L.push('        });');
+    L.push('      }');
+    L.push('      return pwEl;');
+    L.push('    })');
+    L.push('    .then(function (pwEl) {');
+    L.push('      if (!pwEl) {');
+    L.push('        console.log("No password field found — may already be logged in or single-step login");');
     L.push('        return;');
     L.push('      }');
     L.push('      console.log("Password field found — filling password");');
@@ -540,7 +1299,7 @@ function generateReproScript(bugId, bugTitle, bugDescription, devServerUrl, test
     L.push('        })');
     L.push('        .then(function () {');
     L.push('          // Wait for post-login navigation');
-    L.push('          return page.waitForNavigation({ waitUntil: "networkidle0", timeout: 30000 }).catch(function () {});');
+    L.push('          return page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(function () {});');
     L.push('        });');
     L.push('    })');
     L.push('    .then(function () {');
@@ -551,7 +1310,160 @@ function generateReproScript(bugId, bugTitle, bugDescription, devServerUrl, test
   } else {
     // No credentials — just navigate
     L.push('    // ── Navigate (no credentials configured) ──');
-    L.push('    return page.goto(BASE_URL, { waitUntil: "networkidle0", timeout: 30000 })');
+    L.push('    return page.goto(BASE_URL, { waitUntil: "networkidle2", timeout: 60000 })');
+    L.push('    .then(function () {');
+  }
+
+  // ── Route navigation step (after login OR after initial navigation) ──
+  // Navigate to BASE_URL/#/route — after SSO login, shared domain cookies
+  // mean the dev server recognizes the session without re-auth.
+  L.push('      // ── Step 2: Navigate to bug\'s page ──');
+  L.push('      if (TARGET_ROUTE) {');
+  L.push('        var targetUrl = BASE_URL.replace(/\\/+$/, "") + "/#" + TARGET_ROUTE;');
+  L.push('        console.log("Navigating to target route: " + targetUrl);');
+  L.push('        return page.goto(targetUrl, { waitUntil: "networkidle2", timeout: 30000 })');
+  L.push('          .then(function () {');
+  L.push('            return new Promise(function (r) { setTimeout(r, 5000); });');
+  L.push('          })');
+  L.push('          .then(function () {');
+  L.push('            var currentUrl = page.url();');
+  L.push('            console.log("On target page: " + currentUrl);');
+  L.push('            var routeSegments = TARGET_ROUTE.replace(/^\\//, "").split("/");');
+  L.push('            var lastSeg = routeSegments[routeSegments.length - 1] || "";');
+  L.push('            if (currentUrl.indexOf(lastSeg) !== -1) {');
+  L.push('              result.navigationOk = true;');
+  L.push('              console.log("\\u2705 Navigation verified");');
+  L.push('            } else {');
+  L.push('              return page.evaluate(function () { return window.location.hash; }).then(function (hash) {');
+  L.push('                console.log("URL hash: " + hash);');
+  L.push('                if (hash && hash.indexOf(lastSeg) !== -1) {');
+  L.push('                  result.navigationOk = true;');
+  L.push('                  console.log("\\u2705 Navigation OK via hash");');
+  L.push('                } else {');
+  L.push('                  result.navigationOk = false;');
+  L.push('                  console.log("\\u26a0\\ufe0f Navigation may have failed");');
+  L.push('                  console.log("   Expected: " + lastSeg + " | URL: " + currentUrl + " | Hash: " + hash);');
+  L.push('                }');
+  L.push('              });');
+  L.push('            }');
+  L.push('          })');
+  L.push('          .then(function () {');
+  L.push('            return page.screenshot({ path: SCREENSHOT.replace(".png", "_route_debug.png") }).catch(function () {});');
+  L.push('          });');
+  L.push('      } else {');
+  L.push('        result.navigationOk = true;');
+  L.push('        console.log("No target route \\u2014 staying on current page: " + page.url());');
+  L.push('        return Promise.resolve();');
+  L.push('      }');
+  L.push('    })');
+  L.push('    .then(function () {');
+
+  // ── Layer 2: AI-generated interaction steps ──
+  if (interactionSteps && interactionSteps.length > 0) {
+    L.push('      // ── Step 3: AI-generated interaction steps (' + interactionSteps.length + ' steps) ──');
+    L.push('      console.log("Executing " + ' + JSON.stringify(String(interactionSteps.length)) + ' + " AI-generated interaction steps...");');
+    L.push('      var interactionErrors = [];');
+    L.push('      return Promise.resolve()');
+    for (var si = 0; si < interactionSteps.length; si++) {
+      var step = interactionSteps[si];
+      var stepNum = si + 1;
+      var desc = (step.description || step.action || 'step').replace(/'/g, "\\'").replace(/"/g, '\\"');
+      L.push('      .then(function () {');
+      L.push('        console.log("  Step ' + stepNum + '/' + interactionSteps.length + ': ' + desc + '");');
+
+      if (step.action === 'click') {
+        L.push('        return page.click(' + JSON.stringify(step.selector || 'body') + ').catch(function (e) {');
+        L.push('          console.log("    ⚠ Click failed: " + e.message);');
+        L.push('          interactionErrors.push("Step ' + stepNum + ' click failed: " + e.message);');
+        L.push('        });');
+      } else if (step.action === 'type') {
+        L.push('        return page.click(' + JSON.stringify(step.selector || 'body') + ').then(function () {');
+        L.push('          return page.type(' + JSON.stringify(step.selector || 'body') + ', ' + JSON.stringify(step.text || '') + ');');
+        L.push('        }).catch(function (e) {');
+        L.push('          console.log("    ⚠ Type failed: " + e.message);');
+        L.push('          interactionErrors.push("Step ' + stepNum + ' type failed: " + e.message);');
+        L.push('        });');
+      } else if (step.action === 'waitForSelector') {
+        L.push('        return page.waitForSelector(' + JSON.stringify(step.selector || 'body') + ', { timeout: ' + (step.timeout || 10000) + ' }).catch(function (e) {');
+        L.push('          console.log("    ⚠ Wait failed: " + e.message);');
+        L.push('          interactionErrors.push("Step ' + stepNum + ' wait failed: " + e.message);');
+        L.push('        });');
+      } else if (step.action === 'select') {
+        L.push('        return page.select(' + JSON.stringify(step.selector || 'select') + ', ' + JSON.stringify(step.value || '') + ').catch(function (e) {');
+        L.push('          console.log("    ⚠ Select failed: " + e.message);');
+        L.push('          interactionErrors.push("Step ' + stepNum + ' select failed: " + e.message);');
+        L.push('        });');
+      } else if (step.action === 'wait') {
+        L.push('        return new Promise(function (r) { setTimeout(r, ' + (step.ms || 1000) + '); });');
+      } else if (step.action === 'screenshot') {
+        var ssName = (step.name || 'step_' + stepNum).replace(/[^a-zA-Z0-9_-]/g, '_');
+        L.push('        return page.screenshot({ path: SCREENSHOT.replace(".png", "_' + ssName + '.png") }).catch(function () {});');
+      } else if (step.action === 'hover') {
+        L.push('        return page.hover(' + JSON.stringify(step.selector || 'body') + ').catch(function (e) {');
+        L.push('          console.log("    ⚠ Hover failed: " + e.message);');
+        L.push('          interactionErrors.push("Step ' + stepNum + ' hover failed: " + e.message);');
+        L.push('        });');
+      } else if (step.action === 'assert') {
+        // Assertion step — checks element attribute/text against expected value
+        var assertSel = JSON.stringify(step.selector || 'body');
+        var assertAttr = step.attribute || 'textContent';
+        var assertExpected = step.expected || '';
+        var assertCompare = step.compare || 'equals';
+        L.push('        return page.$(' + assertSel + ').then(function (el) {');
+        L.push('          if (!el) {');
+        L.push('            console.log("    ⚠ Assert element not found: ' + (step.selector || 'body').replace(/"/g, '\\"') + '");');
+        L.push('            result.assertions.push({ step: ' + stepNum + ', status: "element-not-found", selector: ' + assertSel + ' });');
+        L.push('            return;');
+        L.push('          }');
+        if (assertAttr === 'textContent' || assertAttr === 'innerText') {
+          L.push('          return page.evaluate(function (el) { return (el.' + assertAttr + ' || "").trim(); }, el).then(function (actual) {');
+        } else {
+          L.push('          return page.evaluate(function (el, attr) { return (el.getAttribute(attr) || "").trim(); }, el, ' + JSON.stringify(assertAttr) + ').then(function (actual) {');
+        }
+        L.push('            console.log("    Assert: ' + assertAttr + ' = \'" + actual + "\'");');
+        if (assertCompare === 'contains') {
+          L.push('            var matched = actual.toLowerCase().indexOf(' + JSON.stringify(assertExpected.toLowerCase()) + ') !== -1;');
+        } else {
+          L.push('            var matched = actual.toLowerCase() === ' + JSON.stringify(assertExpected.toLowerCase()) + ';');
+        }
+        L.push('            result.assertions.push({');
+        L.push('              step: ' + stepNum + ',');
+        L.push('              attribute: ' + JSON.stringify(assertAttr) + ',');
+        L.push('              expected: ' + JSON.stringify(assertExpected) + ',');
+        L.push('              actual: actual,');
+        L.push('              matched: matched,');
+        L.push('              description: ' + JSON.stringify(desc) + '');
+        L.push('            });');
+        L.push('            if (matched) {');
+        L.push('              console.log("    ✅ ASSERT MATCHED — bug condition confirmed");');
+        L.push('            } else {');
+        L.push('              console.log("    ❌ ASSERT DID NOT MATCH — expected ' + assertExpected.replace(/'/g, '\\\'') + ' but got " + actual);');
+        L.push('            }');
+        L.push('          });');
+        L.push('        }).catch(function (e) {');
+        L.push('          console.log("    ⚠ Assert failed: " + e.message);');
+        L.push('          interactionErrors.push("Step ' + stepNum + ' assert failed: " + e.message);');
+        L.push('        });');
+      } else {
+        L.push('        console.log("    Unknown action: ' + (step.action || 'none') + '");');
+        L.push('        return Promise.resolve();');
+      }
+
+      L.push('      })');
+      // Small delay between steps for page to react
+      if (si < interactionSteps.length - 1) {
+        L.push('      .then(function () { return new Promise(function (r) { setTimeout(r, ' + (step.delayAfter || 500) + '); }); })');
+      }
+    }
+    L.push('      .then(function () {');
+    L.push('        console.log("Interaction steps complete. Errors: " + interactionErrors.length);');
+    L.push('        if (interactionErrors.length > 0) {');
+    L.push('          interactionErrors.forEach(function (e) { result.errors.push(e); });');
+    L.push('        }');
+    L.push('        // Wait for any async UI updates after interactions');
+    L.push('        return new Promise(function (r) { setTimeout(r, 2000); });');
+    L.push('      });');
+    L.push('    })');
     L.push('    .then(function () {');
   }
 
@@ -563,13 +1475,33 @@ function generateReproScript(bugId, bugTitle, bugDescription, devServerUrl, test
   L.push('    .then(function (t) {');
   L.push('      result.title = t;');
   L.push('      // Wait a bit for any late errors');
-  L.push('      return new Promise(function (r) { setTimeout(r, 2000); });');
+  L.push('      return new Promise(function (r) { setTimeout(r, 2000); });')
   L.push('    })');
   L.push('    .then(function () {');
   L.push('      return page.screenshot({ path: SCREENSHOT }).catch(function () {});');
   L.push('    })');
   L.push('    .then(function () {');
-  L.push('      result.passed = result.errors.length === 0;');
+  L.push('      // Determine result based on assertions + errors');
+  L.push('      var bugAssertions = result.assertions.filter(function (a) { return a.matched; });');
+  L.push('      if (bugAssertions.length > 0) {');
+  L.push('        // At least one assertion confirmed the buggy behavior');
+  L.push('        result.passed = false;');
+  L.push('        result.bugConfirmed = true;');
+  L.push('        console.log("BUG CONFIRMED by " + bugAssertions.length + " assertion(s)");');
+  L.push('      } else if (result.assertions.length > 0) {');
+  L.push('        // Assertions ran but none matched bug condition');
+  L.push('        result.passed = true;');
+  L.push('        result.bugConfirmed = false;');
+  L.push('        console.log("Assertions ran but bug condition NOT found");');
+  L.push('      } else {');
+  L.push('        // No assertions — rely on error count');
+  L.push('        result.passed = result.errors.length === 0;');
+  L.push('        result.bugConfirmed = false;');
+  L.push('        if (!result.navigationOk) {');
+  L.push('          result.passed = false;');
+  L.push('          console.log("Test FAILED due to navigation failure");');
+  L.push('        }');
+  L.push('      }');
   L.push('      return browser.close();');
   L.push('    })');
   L.push('    .then(function () { return result; });');
@@ -624,7 +1556,7 @@ function runReproScript(testFileName, callback) {
     var cmd = 'node "' + testFile.replace(/\\/g, '/') + '"';
 
     childProcess.exec(cmd, {
-      cwd: path.join(config.dir, '..'),
+      cwd: BUG_TRACKER_DATA_DIR,
       maxBuffer: 5 * 1024 * 1024,
       timeout: 90000
     }, function (err, stdout, stderr) {
@@ -634,10 +1566,16 @@ function runReproScript(testFileName, callback) {
 
       // Try to parse structured result from output
       var resultMatch = fullOutput.match(/__REPRO_RESULT__(\{.*\})/);
+      var bugConfirmed = false;
+      var assertions = [];
+      var navigationOk = true;
       if (resultMatch) {
         try {
           var parsed = JSON.parse(resultMatch[1]);
           passed = parsed.passed;
+          bugConfirmed = !!parsed.bugConfirmed;
+          assertions = parsed.assertions || [];
+          navigationOk = parsed.navigationOk !== false;
           if (parsed.errors && parsed.errors.length) {
             fullOutput += '\nPage errors: ' + parsed.errors.join('; ');
           }
@@ -651,6 +1589,9 @@ function runReproScript(testFileName, callback) {
 
       callback(null, {
         passed: passed,
+        bugConfirmed: bugConfirmed,
+        assertions: assertions,
+        navigationOk: navigationOk,
         output: fullOutput.substring(0, 5000),
         duration: duration,
         screenshotFile: hasScreenshot ? path.basename(screenshotFile) : null,
@@ -799,11 +1740,65 @@ function handleRequest(req, res) {
     return;
   }
 
+  // GET /routes — return parsed Ember routes for UI dropdown
+  if (pathname === '/routes') {
+    var routes = getCachedRoutes();
+    sendJSON(res, 200, { routes: routes });
+    return;
+  }
+
+  // GET /routes/match?title=...&description=...&module=...&page=... — auto-match bug to a route
+  if (pathname === '/routes/match') {
+    var matchTitle = query.title || '';
+    var matchDesc = query.description || '';
+    var matchModule = query.module || '';
+    var matchPage = query.page || '';
+    var routes2 = getCachedRoutes();
+
+    // If explicit page param given (from parsed description), try direct page match first
+    if (matchPage) {
+      var directPageResult = matchPageNameToRoute(matchPage, routes2);
+      if (directPageResult) {
+        console.log('[agent] 🎯 Direct page match:', matchPage, '→', directPageResult.route.path);
+        sendJSON(res, 200, {
+          matchedRoute: directPageResult.route.path,
+          method: 'direct-page',
+          score: directPageResult.score,
+          totalRoutes: routes2.length
+        });
+        return;
+      }
+    }
+
+    var result = matchBugToRoute(matchTitle, matchDesc, routes2, matchModule);
+    sendJSON(res, 200, {
+      matchedRoute: result.matchedRoute,
+      method: result.method || 'keyword',
+      score: result.score || 0,
+      parsedDesc: result.parsedDesc || null,
+      totalRoutes: routes2.length
+    });
+    return;
+  }
+
+  // GET /template-context?route=/settings/playbooks — Layer 2: get HBS + components + route JS
+  if (pathname === '/template-context') {
+    var routeParam = query.route || '';
+    if (!routeParam) { sendJSON(res, 400, { error: 'Missing ?route= parameter' }); return; }
+    console.log('[agent] GET /template-context route=' + routeParam);
+    var templateCtx = getTemplateContext(routeParam);
+    sendJSON(res, 200, templateCtx);
+    return;
+  }
+
   // GET /search?q=...
   if (pathname === '/search') {
     var q = query.q || '';
     if (!q) { sendJSON(res, 400, { error: 'Missing ?q=' }); return; }
-    sendJSON(res, 200, { files: searchFiles(q) });
+    console.log('[agent] 🔍 Search files:', q);
+    var searchResult = searchFiles(q);
+    console.log('[agent]   → Found', searchResult.length, 'files');
+    sendJSON(res, 200, { files: searchResult });
     return;
   }
 
@@ -811,7 +1806,10 @@ function handleRequest(req, res) {
   if (pathname === '/grep') {
     var gq = query.q || '';
     if (!gq) { sendJSON(res, 400, { error: 'Missing ?q=' }); return; }
-    sendJSON(res, 200, { matches: grepFiles(gq, { isRegex: query.regex === '1' }) });
+    console.log('[agent] 🔎 Grep:', gq);
+    var grepResult = grepFiles(gq, { isRegex: query.regex === '1' });
+    console.log('[agent]   → Found', grepResult.length, 'matches');
+    sendJSON(res, 200, { matches: grepResult });
     return;
   }
 
@@ -819,10 +1817,12 @@ function handleRequest(req, res) {
   if (pathname === '/read-file') {
     var fp = query.path || '';
     if (!fp) { sendJSON(res, 400, { error: 'Missing ?path=' }); return; }
+    console.log('[agent] 📄 Read file:', fp);
     var start = query.start ? parseInt(query.start, 10) : undefined;
     var end = query.end ? parseInt(query.end, 10) : undefined;
     var result = readFile(fp, start, end);
-    if (result.error) { sendJSON(res, 400, result); return; }
+    if (result.error) { console.log('[agent]   ❌', result.error); sendJSON(res, 400, result); return; }
+    console.log('[agent]   →', result.totalLines, 'lines');
     sendJSON(res, 200, result);
     return;
   }
@@ -832,6 +1832,12 @@ function handleRequest(req, res) {
     var kwStr = query.keywords || '';
     if (!kwStr) { sendJSON(res, 400, { error: 'Missing ?keywords=' }); return; }
     var keywords = kwStr.split(',').map(function (k) { return k.trim(); }).filter(Boolean);
+    console.log('');
+    console.log('[agent] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('[agent] 🔎 ANALYZE request received');
+    console.log('[agent]   Keywords (' + keywords.length + '):', keywords.join(', '));
+    var _agentAnalyzeStart = Date.now();
+    var keywords = kwStr.split(',').map(function (k) { return k.trim(); }).filter(Boolean);
     // Receive code-identifier keyword metadata for weighted scoring
     var codeKwStr = query.codeKeywords || '';
     var codeKwSet = {};
@@ -840,7 +1846,20 @@ function handleRequest(req, res) {
         .forEach(function (k) { codeKwSet[k] = true; });
     }
     keywords._codeKeywords = codeKwSet;
-    sendJSON(res, 200, analyzeForBug(keywords));
+    var analyzeResult = analyzeForBug(keywords);
+    console.log('[agent]   Relevant files:', (analyzeResult.relevantFiles || []).length);
+    console.log('[agent]   Code matches:', (analyzeResult.codeMatches || []).length);
+    console.log('[agent]   File contents loaded:', (analyzeResult.fileContents || []).length);
+    if (analyzeResult.relevantFiles && analyzeResult.relevantFiles.length > 0) {
+      console.log('[agent]   Top files:');
+      analyzeResult.relevantFiles.slice(0, 5).forEach(function (f) {
+        console.log('[agent]     - ' + f);
+      });
+    }
+    console.log('[agent]   Scan time:', (Date.now() - _agentAnalyzeStart) + 'ms');
+    console.log('[agent] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('');
+    sendJSON(res, 200, analyzeResult);
     return;
   }
 
@@ -849,6 +1868,7 @@ function handleRequest(req, res) {
     readAgentBody(req, function (bodyErr, body) {
       if (bodyErr) { sendJSON(res, 400, { error: bodyErr.message }); return; }
       if (!body.path) { sendJSON(res, 400, { error: 'Missing path' }); return; }
+      console.log('[agent] ✏️ Write file:', body.path);
       var fullPath = path.resolve(config.dir, body.path);
       if (!isInsideRoot(config.dir, fullPath)) {
         sendJSON(res, 403, { error: 'Path is outside project directory' }); return;
@@ -912,8 +1932,12 @@ function handleRequest(req, res) {
     readAgentBody(req, function (bodyErr, body) {
       if (bodyErr) { sendJSON(res, 400, { error: bodyErr.message }); return; }
       if (!body.bugId) { sendJSON(res, 400, { error: 'Missing bugId' }); return; }
-      var result = generateReproScript(body.bugId, body.bugTitle || '', body.bugDescription || '', body.devServerUrl || '', body.testUsername || '', body.testPassword || '');
-      if (result.error) { sendJSON(res, 500, result); return; }
+      console.log('[agent] 🎭 Playwright generate for bug:', body.bugId);
+      if (body.targetRoute) console.log('[agent]   Target route:', body.targetRoute);
+      if (body.interactionSteps && body.interactionSteps.length) console.log('[agent]   Interaction steps:', body.interactionSteps.length);
+      var result = generateReproScript(body.bugId, body.bugTitle || '', body.bugDescription || '', body.devServerUrl || '', body.testUsername || '', body.testPassword || '', body.targetRoute || '', body.interactionSteps || []);
+      if (result.error) { console.log('[agent]   \u274c', result.error); sendJSON(res, 500, result); return; }
+      console.log('[agent]   \u2705 Script generated:', result.testFile);
       sendJSON(res, 200, result);
     });
     return;
@@ -924,8 +1948,10 @@ function handleRequest(req, res) {
     readAgentBody(req, function (bodyErr, body) {
       if (bodyErr) { sendJSON(res, 400, { error: bodyErr.message }); return; }
       if (!body.testFile) { sendJSON(res, 400, { error: 'Missing testFile' }); return; }
+      console.log('[agent] 🏃 Playwright run:', body.testFile);
       runReproScript(body.testFile, function (err, result) {
-        if (err) { sendJSON(res, 500, { error: err.message }); return; }
+        if (err) { console.log('[agent]   ❌', err.message); sendJSON(res, 500, { error: err.message }); return; }
+        console.log('[agent]   → Passed:', result.passed, '| Duration:', result.duration + 'ms');
         sendJSON(res, 200, result);
       });
     });

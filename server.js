@@ -570,11 +570,83 @@ function handleRequest(req, res) {
       var claudeClient = require('./lib/claude-client');
       readBody(req, function (bodyErr, body) {
         var extraDescription = (body && body.extraDescription) ? body.extraDescription : '';
-        console.log('[analyze] Request for bug:', analyzeMatch[1], 'userId:', userId, 'extraDesc length:', extraDescription.length);
+        var targetRoute = (body && body.targetRoute) ? body.targetRoute : '';
+        console.log('');
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log('[STEP 1/6] 📥 Analyze request received');
+        console.log('  Bug ID:', analyzeMatch[1]);
+        console.log('  User:', userId);
+        console.log('  Extra description:', extraDescription.length, 'chars');
+        console.log('  Target route:', targetRoute || '(auto-detect)');
+        console.log('  Time:', new Date().toLocaleTimeString());
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log('');
+        console.log('[STEP 2/6] 🔍 Fetching bug details from Zoho...');
+        var _analyzeStart = Date.now();
         bugService.getBugDetails(userId, analyzeMatch[1], function (err, bugData) {
-          if (err) { console.error('[analyze] getBugDetails error:', err.message); return send500(res, err.message); }
+          if (err) { console.error('[STEP 2/6] ❌ getBugDetails FAILED:', err.message); return send500(res, err.message); }
+          console.log('[STEP 2/6] ✅ Bug details fetched in', (Date.now() - _analyzeStart) + 'ms');
+          console.log('  Title:', (bugData.bug.title || '').substring(0, 80));
+          console.log('  Status:', bugData.bug.status, '| Severity:', bugData.bug.severity);
+          console.log('  Attachments:', (bugData.attachments || []).length, '| Comments:', (bugData.comments || []).length);
           var analyzeUser = userStore.getUser(userId);
-          console.log('[analyze] User agentUrl:', JSON.stringify(analyzeUser.agentUrl), 'projectDir:', JSON.stringify(analyzeUser.projectDir));
+          // Store parsed structured description for use in interaction steps & fix prompt
+          var _parsedDesc = null;
+
+          // ── Server-side auto-detect route when not manually specified ──
+          function autoDetectAndContinue() {
+            if (targetRoute || !analyzeUser.agentUrl) {
+              // Route already specified or no agent — skip auto-detect
+              if (targetRoute) console.log('[AUTO-DETECT] ✅ Manual route provided:', targetRoute);
+              return continueWithAnalysis();
+            }
+
+            console.log('[AUTO-DETECT] 🔍 No route specified — auto-detecting from bug data...');
+            var bugModule = bugData.bug.module || '';
+            var bugTitle2 = bugData.bug.title || '';
+            var bugDesc2 = bugData.bug.description || '';
+            // Also check extra description for structured format
+            var combinedDesc = bugDesc2 + (extraDescription ? '\n' + extraDescription : '');
+
+            var matchUrl = analyzeUser.agentUrl.replace(/\/+$/, '') +
+              '/routes/match?title=' + encodeURIComponent(bugTitle2) +
+              '&description=' + encodeURIComponent(combinedDesc.substring(0, 2000)) +
+              '&module=' + encodeURIComponent(bugModule);
+
+            var matchReq = require('http').get(matchUrl, function (matchRes) {
+              var matchBody = '';
+              matchRes.on('data', function (chunk) { matchBody += chunk; });
+              matchRes.on('end', function () {
+                try {
+                  var matchData = JSON.parse(matchBody);
+                  if (matchData.matchedRoute) {
+                    targetRoute = matchData.matchedRoute;
+                    _parsedDesc = matchData.parsedDesc || null;
+                    console.log('[AUTO-DETECT] ✅ Route detected:', targetRoute, '(method:', matchData.method + ', score:', matchData.score + ')');
+                  } else {
+                    _parsedDesc = matchData.parsedDesc || null;
+                    console.log('[AUTO-DETECT] ⚠️ No confident route match found (method:', matchData.method + ', score:', matchData.score + ')');
+                  }
+                } catch (e) {
+                  console.log('[AUTO-DETECT] ⚠️ Parse error:', e.message);
+                }
+                continueWithAnalysis();
+              });
+            });
+            matchReq.on('error', function (e) {
+              console.log('[AUTO-DETECT] ⚠️ Agent unreachable:', e.message, '— continuing without route');
+              continueWithAnalysis();
+            });
+            matchReq.setTimeout(5000, function () { matchReq.abort(); });
+          }
+
+          function continueWithAnalysis() {
+          console.log('');
+          console.log('[STEP 3/6] 📂 Code scanning config:');
+          console.log('  Agent URL:', JSON.stringify(analyzeUser.agentUrl) || '(none — local mode)');
+          console.log('  Project dir:', JSON.stringify(analyzeUser.projectDir) || '(none)');
+          console.log('  AI model:', analyzeUser.aiModel || 'claude-opus-4-6 (default)');
+          if (targetRoute) console.log('  Target route:', targetRoute);
 
           // Helper: after code analysis, route to AI provider, then respond
           // Routing order:
@@ -582,6 +654,13 @@ function handleRequest(req, res) {
           //   2. GitHub Models API (for non-Claude models, uses PAT)
           //   3. Anthropic Direct API (for Claude models, uses Anthropic key)
           function respondWithAnalysis(result, agentError) {
+            console.log('');
+            console.log('[STEP 4/6] ✅ Code scanning complete');
+            console.log('  Relevant files:', result.analysis ? result.analysis.relevantFiles.length : 0);
+            console.log('  Code matches:', result.analysis ? (result.analysis.codeMatches || []).length : 0);
+            console.log('  File contents loaded:', result.analysis ? (result.analysis.fileContents || []).length : 0);
+            console.log('  Prompt length:', result.prompt.length, 'chars');
+            if (agentError) console.log('  ⚠️ Agent error:', agentError);
             var copilotBridge = require('./lib/copilot-bridge-client');
             // Default to claude-opus-4-6 for best results via Copilot Bridge
             var aiModel = analyzeUser.aiModel || 'claude-opus-4-6';
@@ -591,7 +670,14 @@ function handleRequest(req, res) {
             var devServerUrl = analyzeUser.devServerUrl || '';
 
             function sendFinalResponse(aiResult, reproResult) {
-              console.log('[analyze] AI fix received —', aiResult.text.length, 'chars, model:', aiResult.model);
+              console.log('');
+              console.log('[STEP 6/6] ✅ AI response received!');
+              console.log('  Model:', aiResult.model);
+              console.log('  Response length:', aiResult.text.length, 'chars');
+              console.log('  Usage:', JSON.stringify(aiResult.usage || {}));
+              console.log('  Total time:', ((Date.now() - _analyzeStart) / 1000).toFixed(1) + 's');
+              console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+              console.log('');
 
               // Save prompt log to agent if available
               var promptLogData = {
@@ -623,7 +709,11 @@ function handleRequest(req, res) {
             }
 
             function sendError(errMsg, reproResult) {
-              console.error('[analyze] AI error:', errMsg);
+              console.error('');
+              console.error('[STEP 6/6] ❌ AI ERROR:', errMsg);
+              console.error('  Total time:', ((Date.now() - _analyzeStart) / 1000).toFixed(1) + 's');
+              console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+              console.error('');
               sendJSON(res, 200, {
                 prompt: result.prompt,
                 analysis: result.analysis,
@@ -635,49 +725,349 @@ function handleRequest(req, res) {
               });
             }
 
+            // ── Layer 2: Build AI interaction steps prompt from template context ──
+            function buildInteractionStepsPrompt(bugTitle, bugDesc, templateCtx) {
+              var lines = [];
+              lines.push('You are helping reproduce a bug in an Ember.js 1.13.15 application by generating Puppeteer browser interaction steps.');
+              lines.push('');
+              lines.push('## Bug');
+              lines.push('Title: ' + (bugTitle || 'Unknown'));
+              lines.push('Description: ' + (bugDesc || 'No description'));
+              lines.push('');
+
+              if (templateCtx.template) {
+                lines.push('## Page Template (HBS)');
+                lines.push('File: ' + templateCtx.template.path);
+                lines.push('```hbs');
+                // Limit template size to keep prompt manageable
+                var tContent = templateCtx.template.content;
+                if (tContent.length > 6000) tContent = tContent.substring(0, 6000) + '\n{{!-- truncated --}}';
+                lines.push(tContent);
+                lines.push('```');
+                lines.push('');
+              }
+
+              if (templateCtx.componentTemplates && templateCtx.componentTemplates.length > 0) {
+                lines.push('## Component Templates');
+                templateCtx.componentTemplates.forEach(function (ct) {
+                  lines.push('### ' + ct.name);
+                  lines.push('**Template:** ' + (ct.path || ct.name + '/template.hbs'));
+                  lines.push('```hbs');
+                  var cContent = ct.content;
+                  if (cContent.length > 4000) cContent = cContent.substring(0, 4000) + '\n{{!-- truncated --}}';
+                  lines.push(cContent);
+                  lines.push('```');
+                  if (ct.jsContent) {
+                    lines.push('**Component JS:** ' + (ct.jsPath || ct.name + '/component.js'));
+                    lines.push('```js');
+                    var jsC = ct.jsContent;
+                    if (jsC.length > 3000) jsC = jsC.substring(0, 3000) + '\n// ... truncated ...';
+                    lines.push(jsC);
+                    lines.push('```');
+                  }
+                  lines.push('');
+                });
+              }
+
+              if (templateCtx.routeJS && templateCtx.routeJS.length > 0) {
+                lines.push('## Route/Controller JS');
+                templateCtx.routeJS.forEach(function (rj) {
+                  lines.push('### ' + rj.path + ' (' + rj.type + ')');
+                  lines.push('```js');
+                  lines.push(rj.content);
+                  lines.push('```');
+                  lines.push('');
+                });
+              }
+
+              lines.push('## Task');
+              lines.push('Generate a JSON array of Puppeteer interaction steps to reproduce AND VERIFY this bug on the page.');
+              lines.push('Look at the HBS templates to identify interactive elements (buttons, inputs, links, dropdowns, etc.).');
+              lines.push('Create a realistic sequence of user interactions that would trigger the bug described above.');
+              lines.push('');
+              lines.push('CRITICAL: You MUST include at least one "assert" step that verifies the BUGGY condition.');
+              lines.push('The assert step checks whether the bug exists. If the assert matches, it means the bug IS present.');
+              lines.push('For example, if the bug says placeholder shows "Search Service" instead of "Search Services",');
+              lines.push('use: { "action": "assert", "selector": "input.search", "attribute": "placeholder", "expected": "Search Service", "description": "Bug: placeholder says Search Service" }');
+              lines.push('The "expected" value should be the INCORRECT/BUGGY value from the bug report.');
+              lines.push('');
+              lines.push('Each step must be one of:');
+              lines.push('- { "action": "click", "selector": "CSS selector", "description": "why" }');
+              lines.push('- { "action": "type", "selector": "CSS selector", "text": "text to type", "description": "why" }');
+              lines.push('- { "action": "waitForSelector", "selector": "CSS selector", "description": "why" }');
+              lines.push('- { "action": "select", "selector": "CSS selector", "value": "option value", "description": "why" }');
+              lines.push('- { "action": "hover", "selector": "CSS selector", "description": "why" }');
+              lines.push('- { "action": "wait", "ms": 1000, "description": "why" }');
+              lines.push('- { "action": "screenshot", "name": "step_name", "description": "why" }');
+              lines.push('- { "action": "assert", "selector": "CSS selector", "attribute": "placeholder|textContent|innerText|value|class|title|aria-label|etc", "expected": "expected BUGGY value", "compare": "equals|contains", "description": "what the assert verifies" }');
+              lines.push('');
+              lines.push('Guidelines:');
+              lines.push('- Use CSS selectors that match the HBS template elements. Prefer class selectors, data attributes, or IDs.');
+              lines.push('- Ember uses {{action "name"}} — map these to their containing element\'s CSS class/ID.');
+              lines.push('- Include waitForSelector before interacting with elements that may load asynchronously.');
+              lines.push('- Add a screenshot step after key interactions (especially where the bug might manifest).');
+              lines.push('- ALWAYS include 1-3 "assert" steps that CHECK for the buggy condition described in the bug report.');
+              lines.push('- The assert "expected" value is the WRONG/BUGGY value (what the bug says is happening, not what SHOULD happen).');
+              lines.push('- If the bug is visual (wrong text, placeholder, label, CSS), assert the text/attribute.');
+              lines.push('- If the bug is behavioral (clicking X does Y wrong), assert the state after the action.');
+              lines.push('- Keep the sequence practical: 5-15 steps typically suffice.');
+              lines.push('');
+              lines.push('Return ONLY a valid JSON array. No explanation, no markdown fences, no text before or after the JSON.');
+
+              return lines.join('\n');
+            }
+
+            /**
+             * Parse AI response into interaction steps JSON array.
+             * Handles cases where AI wraps response in markdown fences or adds text.
+             */
+            function parseInteractionSteps(aiText) {
+              if (!aiText) return [];
+              // Strip markdown fences if present
+              var cleaned = aiText.trim();
+              cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '');
+              // Try to find JSON array in the response
+              var arrayMatch = cleaned.match(/\[[\s\S]*\]/);
+              if (!arrayMatch) {
+                console.log('[Layer 2] Could not find JSON array in AI response');
+                return [];
+              }
+              try {
+                var steps = JSON.parse(arrayMatch[0]);
+                if (!Array.isArray(steps)) return [];
+                // Validate each step has required fields
+                return steps.filter(function (s) {
+                  return s && s.action && typeof s.action === 'string';
+                });
+              } catch (e) {
+                console.log('[Layer 2] JSON parse error:', e.message);
+                return [];
+              }
+            }
+
+            /**
+             * Get AI-generated interaction steps using template context.
+             * Calls: agent (template context) → AI (interaction steps) → callback(steps[])
+             */
+            function getInteractionSteps(callback) {
+              if (!analyzeUser.agentUrl || !targetRoute) {
+                return callback([]); // No agent or no route — skip
+              }
+
+              // ── Check for parsed QA steps first (skip AI if available) ──
+              if (_parsedDesc && _parsedDesc.steps && _parsedDesc.steps.length > 0) {
+                console.log('[Layer 2] 📋 Using', _parsedDesc.steps.length, 'parsed QA steps (skipping AI step generation)');
+                // Convert QA text steps into Puppeteer-compatible step objects
+                var qaSteps = _parsedDesc.steps.map(function (stepText, idx) {
+                  var step = { description: stepText };
+                  // Try to detect action type from step text
+                  var lower = stepText.toLowerCase();
+                  if (lower.match(/^(?:click|press|tap)\s/i)) {
+                    step.action = 'click';
+                    step.selector = ''; // Will be resolved by template matching in agent
+                    step.hint = stepText.replace(/^(?:click|press|tap)\s+(?:on\s+)?(?:the\s+)?/i, '');
+                  } else if (lower.match(/^(?:type|enter|input|fill)\s/i)) {
+                    step.action = 'type';
+                    step.selector = '';
+                    var typeMatch = stepText.match(/(?:type|enter|input|fill)\s+["']([^"']+)["']/i);
+                    step.text = typeMatch ? typeMatch[1] : '';
+                    step.hint = stepText.replace(/^(?:type|enter|input|fill)\s+(?:in\s+)?(?:the\s+)?/i, '');
+                  } else if (lower.match(/^(?:select|choose|pick)\s/i)) {
+                    step.action = 'select';
+                    step.selector = '';
+                    step.hint = stepText.replace(/^(?:select|choose|pick)\s+/i, '');
+                  } else if (lower.match(/^(?:hover|mouse\s*over)\s/i)) {
+                    step.action = 'hover';
+                    step.selector = '';
+                    step.hint = stepText.replace(/^(?:hover|mouse\s*over)\s+(?:on\s+)?(?:the\s+)?/i, '');
+                  } else if (lower.match(/^(?:wait|pause)/i)) {
+                    step.action = 'wait';
+                    step.ms = 2000;
+                  } else if (lower.match(/^(?:navigate|go\s+to|open)/i)) {
+                    step.action = 'navigate';
+                    step.hint = stepText.replace(/^(?:navigate\s+to|go\s+to|open)\s+(?:the\s+)?/i, '');
+                  } else if (lower.match(/^(?:refresh|reload)/i)) {
+                    step.action = 'reload';
+                  } else {
+                    // Generic step — let AI resolve it
+                    step.action = 'click';
+                    step.selector = '';
+                    step.hint = stepText;
+                  }
+                  return step;
+                });
+                // Add screenshot at the end to capture bug state
+                qaSteps.push({ action: 'screenshot', name: 'after_steps', description: 'Capture state after QA steps' });
+                qaSteps.forEach(function (s, idx) {
+                  console.log('[Layer 2]   Parsed step', (idx + 1) + ':', s.action, '-', s.description || s.hint || '');
+                });
+                return callback(qaSteps);
+              }
+
+              console.log('[Layer 2] 🧠 Getting template context for route:', targetRoute);
+              agentProxy.getTemplateContext(analyzeUser.agentUrl, targetRoute).then(function (templateCtx) {
+                if (!templateCtx.hasTemplate) {
+                  console.log('[Layer 2] ⚠️ No HBS template found for route — skipping interaction steps');
+                  return callback([]);
+                }
+                console.log('[Layer 2] ✅ Template context received:',
+                  templateCtx.totalTemplates, 'templates,',
+                  (templateCtx.routeJS || []).length, 'JS files');
+
+                // Build AI prompt
+                var stepsPrompt = buildInteractionStepsPrompt(
+                  bugData.bug.title || '',
+                  bugData.bug.description || '',
+                  templateCtx
+                );
+                console.log('[Layer 2] 📝 Interaction steps prompt:', stepsPrompt.length, 'chars');
+
+                // Call AI for interaction steps (use same routing as main analysis)
+                console.log('[Layer 2] 🤖 Asking AI for interaction steps...');
+                var copilotBridge = require('./lib/copilot-bridge-client');
+                copilotBridge.checkHealth(function (hErr, hData) {
+                  if (!hErr && hData && hData.ok) {
+                    copilotBridge.analyze(stepsPrompt, aiModel, function (bErr, bResult) {
+                      if (!bErr && bResult && bResult.text) {
+                        var steps = parseInteractionSteps(bResult.text);
+                        console.log('[Layer 2] ✅ AI returned', steps.length, 'interaction steps');
+                        steps.forEach(function (s, idx) {
+                          console.log('[Layer 2]   Step', (idx + 1) + ':', s.action, s.selector || '', '-', s.description || '');
+                        });
+                        return callback(steps);
+                      }
+                      console.log('[Layer 2] ⚠️ Copilot Bridge failed for steps:', bErr ? bErr.message : 'empty response');
+                      // Try fallback
+                      tryStepsFallback(stepsPrompt, callback);
+                    });
+                  } else {
+                    tryStepsFallback(stepsPrompt, callback);
+                  }
+                });
+              }).catch(function (tErr) {
+                console.log('[Layer 2] ⚠️ Template context failed:', tErr.message);
+                callback([]);
+              });
+            }
+
+            function tryStepsFallback(stepsPrompt, callback) {
+              var isClaude2 = githubAI.isClaudeModel(aiModel);
+              var claudeKey2 = analyzeUser.claudeApiKey || '';
+              var githubToken2 = analyzeUser.githubToken || '';
+
+              if (isClaude2 && claudeKey2) {
+                claudeClient.analyze(claudeKey2, stepsPrompt, { model: aiModel }, function (clErr, clResult) {
+                  if (!clErr && clResult && clResult.text) {
+                    var steps = parseInteractionSteps(clResult.text);
+                    console.log('[Layer 2] ✅ Anthropic returned', steps.length, 'interaction steps');
+                    return callback(steps);
+                  }
+                  console.log('[Layer 2] ⚠️ Anthropic fallback failed:', clErr ? clErr.message : 'empty');
+                  callback([]);
+                });
+              } else if (!isClaude2 && githubToken2) {
+                githubAI.analyze(githubToken2, stepsPrompt, { model: aiModel }, function (ghErr, ghResult) {
+                  if (!ghErr && ghResult && ghResult.text) {
+                    var steps = parseInteractionSteps(ghResult.text);
+                    console.log('[Layer 2] ✅ GitHub Models returned', steps.length, 'interaction steps');
+                    return callback(steps);
+                  }
+                  console.log('[Layer 2] ⚠️ GitHub Models fallback failed:', ghErr ? ghErr.message : 'empty');
+                  callback([]);
+                });
+              } else {
+                console.log('[Layer 2] ⚠️ No AI fallback available for interaction steps');
+                callback([]);
+              }
+            }
+
             // Step 0: Try browser reproduction (if agent is available)
             function attemptReproduction(callback) {
               if (!analyzeUser.agentUrl) {
                 return callback(null); // No agent — skip reproduction
               }
 
-              console.log('[analyze] Attempting browser reproduction for bug:', analyzeMatch[1]);
-              agentProxy.playwrightGenerate(
-                analyzeUser.agentUrl,
-                analyzeMatch[1],
-                bugData.bug.title || '',
-                bugData.bug.description || '',
-                devServerUrl,
-                analyzeUser.testUsername || '',
-                analyzeUser.testPassword || ''
-              ).then(function (genResult) {
-                console.log('[analyze] Reproduction script generated:', genResult.testFile);
-                // Run the test
-                agentProxy.playwrightRun(analyzeUser.agentUrl, genResult.testFile).then(function (runResult) {
-                  console.log('[analyze] Reproduction result — passed:', runResult.passed, 'duration:', runResult.duration + 'ms');
-                  callback({
-                    attempted: true,
-                    passed: runResult.passed,
-                    reproduced: !runResult.passed, // test failing = bug reproduced
-                    output: runResult.output,
-                    duration: runResult.duration,
-                    testFile: genResult.testFile,
-                    screenshotFile: runResult.screenshotFile
+              // Layer 2: Get AI interaction steps first, then generate + run script
+              console.log('');
+              console.log('[STEP 5a] 🎭 Attempting Playwright browser reproduction...');
+              if (targetRoute) console.log('[STEP 5a] 📍 Target route:', targetRoute);
+
+              getInteractionSteps(function (interactionSteps) {
+                if (interactionSteps.length > 0) {
+                  console.log('[STEP 5a] 🧠 Using', interactionSteps.length, 'AI-generated interaction steps');
+                } else {
+                  console.log('[STEP 5a] ℹ️ No interaction steps — observe-only mode');
+                }
+
+                agentProxy.playwrightGenerate(
+                  analyzeUser.agentUrl,
+                  analyzeMatch[1],
+                  bugData.bug.title || '',
+                  bugData.bug.description || '',
+                  devServerUrl,
+                  analyzeUser.testUsername || '',
+                  analyzeUser.testPassword || '',
+                  targetRoute,
+                  interactionSteps
+                ).then(function (genResult) {
+                  console.log('[STEP 5a] ✅ Reproduction script generated:', genResult.testFile);
+                  console.log('[STEP 5a] 🏃 Running reproduction script...');
+                  // Run the test
+                  agentProxy.playwrightRun(analyzeUser.agentUrl, genResult.testFile).then(function (runResult) {
+                    // Determine reproduction status from assertions + pass/fail
+                    var bugConfirmed = !!runResult.bugConfirmed;
+                    var assertions = runResult.assertions || [];
+                    var navigationOk = runResult.navigationOk !== false;
+                    var reproduced = bugConfirmed || !runResult.passed;
+                    var status = 'not-reproduced';
+                    if (bugConfirmed) {
+                      status = 'bug-confirmed';
+                      console.log('[STEP 5a] 🔴 Bug CONFIRMED by assertion(s)');
+                    } else if (!navigationOk) {
+                      status = 'navigation-failed';
+                      console.log('[STEP 5a] ⚠️ Navigation failed — test inconclusive');
+                      reproduced = false;
+                    } else if (!runResult.passed) {
+                      status = 'test-errors';
+                      console.log('[STEP 5a] ⚠️ Test had errors (may or may not indicate bug)');
+                    } else if (assertions.length > 0) {
+                      status = 'assertions-passed';
+                      console.log('[STEP 5a] ✅ Assertions ran — bug condition NOT found');
+                    } else {
+                      status = 'no-assertions';
+                      console.log('[STEP 5a] ℹ️ No assertions — test completed without verification');
+                    }
+                    console.log('[STEP 5a] Result — status:', status, 'passed:', runResult.passed, 'bugConfirmed:', bugConfirmed, 'duration:', runResult.duration + 'ms');
+                    callback({
+                      attempted: true,
+                      passed: runResult.passed,
+                      reproduced: reproduced,
+                      bugConfirmed: bugConfirmed,
+                      assertions: assertions,
+                      navigationOk: navigationOk,
+                      status: status,
+                      output: runResult.output,
+                      duration: runResult.duration,
+                      testFile: genResult.testFile,
+                      screenshotFile: runResult.screenshotFile,
+                      interactionSteps: interactionSteps.length
+                    });
+                  }).catch(function (runErr) {
+                    console.log('[STEP 5a] ⚠️ Reproduction run failed:', runErr.message);
+                    callback({
+                      attempted: true,
+                      passed: false,
+                      reproduced: false,
+                      error: runErr.message,
+                      interactionSteps: interactionSteps.length
+                    });
                   });
-                }).catch(function (runErr) {
-                  console.log('[analyze] Reproduction run failed:', runErr.message);
+                }).catch(function (genErr) {
+                  console.log('[STEP 5a] ⚠️ Reproduction generate failed:', genErr.message);
                   callback({
-                    attempted: true,
-                    passed: false,
-                    reproduced: false,
-                    error: runErr.message
+                    attempted: false,
+                    error: genErr.message
                   });
-                });
-              }).catch(function (genErr) {
-                console.log('[analyze] Reproduction generate failed:', genErr.message);
-                callback({
-                  attempted: false,
-                  error: genErr.message
                 });
               });
             }
@@ -686,15 +1076,19 @@ function handleRequest(req, res) {
             attemptReproduction(function (reproResult) {
 
             // Step 1: Try Copilot Bridge first (free, works for Claude + GPT-4o + more)
+            console.log('');
+            console.log('[STEP 5/6] 🤖 Sending prompt to AI...');
+            console.log('  Checking Copilot Bridge...');
             copilotBridge.checkHealth(function (hErr, hData) {
               if (!hErr && hData && hData.ok) {
-                console.log('[analyze] Copilot Bridge available — trying model:', aiModel);
+                console.log('[STEP 5/6] ✅ Copilot Bridge available — sending to model:', aiModel);
                 copilotBridge.analyze(result.prompt, aiModel, function (bErr, bResult) {
                   if (!bErr) return sendFinalResponse(bResult, reproResult);
-                  console.log('[analyze] Bridge failed:', bErr.message, '— trying fallback');
+                  console.log('[STEP 5/6] ⚠️ Copilot Bridge failed:', bErr.message, '— trying fallback...');
                   tryFallback(reproResult);
                 });
               } else {
+                console.log('[STEP 5/6] Copilot Bridge not available —', hErr ? hErr.message : 'trying fallback...');
                 tryFallback(reproResult);
               }
             });
@@ -704,7 +1098,8 @@ function handleRequest(req, res) {
               if (isClaude) {
                 // Claude → Anthropic Direct API (needs Anthropic key)
                 if (claudeKey) {
-                  console.log('[analyze] Using Anthropic Direct API — model:', aiModel);
+                  console.log('[STEP 5/6] 📡 Using Anthropic Direct API — model:', aiModel);
+                  console.log('  Waiting for Claude response (may take 30-120s)...');
                   claudeClient.analyze(claudeKey, result.prompt, { model: aiModel }, function (clErr, clResult) {
                     if (!clErr) return sendFinalResponse(clResult, reproRes);
                     sendError('Anthropic API: ' + clErr.message, reproRes);
@@ -717,7 +1112,8 @@ function handleRequest(req, res) {
               } else {
                 // Non-Claude → GitHub Models API (needs PAT)
                 if (githubToken) {
-                  console.log('[analyze] Using GitHub Models API — model:', aiModel);
+                  console.log('[STEP 5/6] 📡 Using GitHub Models API — model:', aiModel);
+                  console.log('  Waiting for AI response (may take 30-120s)...');
                   githubAI.analyze(githubToken, result.prompt, { model: aiModel }, function (ghErr, ghResult) {
                     if (!ghErr) return sendFinalResponse(ghResult, reproRes);
                     sendError('GitHub Models API: ' + ghErr.message, reproRes);
@@ -733,18 +1129,59 @@ function handleRequest(req, res) {
 
           if (analyzeUser.agentUrl) {
             // Agent mode: proxy analysis through agent
-            fixPrompt.generatePromptViaAgent(userId, bugData, analyzeUser.agentUrl, extraDescription, function (promptErr, result) {
-              if (promptErr) return send500(res, 'Agent error: ' + promptErr.message);
-              console.log('[analyze] Agent result — files:', (result.analysis ? result.analysis.relevantFiles.length : 0), 'agentError:', result.agentError || 'none');
-              respondWithAnalysis(result, result.agentError);
-            });
+            // First, fetch template context for the target route (Layer 2)
+            // so the fix prompt includes the actual page files
+            console.log('');
+            var _templateCtx = null;
+            function fetchTemplateContextThenScan() {
+              if (targetRoute && analyzeUser.agentUrl) {
+                console.log('[STEP 3/6] 🎯 Fetching page template context for route:', targetRoute);
+                agentProxy.getTemplateContext(analyzeUser.agentUrl, targetRoute).then(function (tCtx) {
+                  if (tCtx && tCtx.hasTemplate) {
+                    _templateCtx = tCtx;
+                    console.log('[STEP 3/6] ✅ Template context:',
+                      tCtx.totalTemplates, 'templates,',
+                      (tCtx.routeJS || []).length, 'JS files,',
+                      (tCtx.componentTemplates || []).length, 'components');
+                  } else {
+                    console.log('[STEP 3/6] ⚠️ No template found for route — using keyword scan only');
+                  }
+                  doAgentScan();
+                }).catch(function (tErr) {
+                  console.log('[STEP 3/6] ⚠️ Template context fetch failed:', tErr.message, '— continuing with keyword scan');
+                  doAgentScan();
+                });
+              } else {
+                doAgentScan();
+              }
+            }
+
+            function doAgentScan() {
+              console.log('[STEP 3/6] 🔎 Scanning code via AGENT at', analyzeUser.agentUrl, '...');
+              var _scanStart = Date.now();
+              fixPrompt.generatePromptViaAgent(userId, bugData, analyzeUser.agentUrl, extraDescription, function (promptErr, result) {
+                if (promptErr) return send500(res, 'Agent error: ' + promptErr.message);
+                console.log('[STEP 3/6] ✅ Agent scan complete in', (Date.now() - _scanStart) + 'ms');
+                console.log('  Files found:', (result.analysis ? result.analysis.relevantFiles.length : 0), '| Agent error:', result.agentError || 'none');
+                respondWithAnalysis(result, result.agentError);
+              }, _templateCtx, _parsedDesc);
+            }
+
+            fetchTemplateContextThenScan();
           } else {
             // Local mode
-            console.log('[analyze] Using local mode with projectDir:', analyzeUser.projectDir);
-            var result = fixPrompt.generatePrompt(userId, bugData, extraDescription);
-            console.log('[analyze] Local result — files:', (result.analysis ? result.analysis.relevantFiles.length : 0));
+            console.log('');
+            console.log('[STEP 3/6] 🔎 Scanning code LOCALLY in', analyzeUser.projectDir, '...');
+            var _scanStart2 = Date.now();
+            var result = fixPrompt.generatePrompt(userId, bugData, extraDescription, _parsedDesc);
+            console.log('[STEP 3/6] ✅ Local scan complete in', (Date.now() - _scanStart2) + 'ms');
+            console.log('  Files found:', (result.analysis ? result.analysis.relevantFiles.length : 0));
             respondWithAnalysis(result, null);
           }
+          } // end continueWithAnalysis
+
+          // Entry point: auto-detect route then continue
+          autoDetectAndContinue();
         });
       });
       return;

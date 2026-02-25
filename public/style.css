@@ -926,6 +926,39 @@ a:hover { text-decoration: underline; }
   opacity: 0.7;
 }
 
+/* ── Format template button + wrapper ─── */
+.extra-desc-wrapper {
+  position: relative;
+  width: 100%;
+}
+.format-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  font-size: 11px;
+  padding: 3px 8px;
+  gap: 4px;
+  opacity: 0.6;
+  transition: opacity 0.2s;
+}
+.format-btn:hover {
+  opacity: 1;
+}
+.extra-desc-input.structured-detected {
+  border-color: #66bb6a;
+  background: rgba(102, 187, 106, 0.04);
+}
+.structured-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  color: #66bb6a;
+  margin-left: 6px;
+  font-weight: 600;
+}
+
 .btn-analyze {
   width: 100%;
   justify-content: center;
@@ -1275,6 +1308,68 @@ a:hover { text-decoration: underline; }
   margin-right: auto;
 }
 
+/* ── Target Route Input ─── */
+.route-input-row {
+  margin-bottom: 8px;
+}
+.route-input-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.route-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.route-badge {
+  font-size: 9px;
+  font-weight: 500;
+  color: #a78bfa;
+  background: rgba(167, 139, 250, 0.1);
+  padding: 1px 6px;
+  border-radius: 3px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.route-input-wrapper {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.route-input {
+  flex: 1;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-family: 'SFMono-Regular', 'Consolas', monospace;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color 0.15s;
+}
+.route-input:focus {
+  border-color: var(--accent);
+}
+.route-input::placeholder {
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.btn-xs {
+  padding: 4px 8px;
+  font-size: 10px;
+  border-radius: 4px;
+  gap: 3px;
+  white-space: nowrap;
+}
+
 /* ── Playwright Reproduction Status ─── */
 .repro-status-body { padding: 0; }
 
@@ -1300,6 +1395,35 @@ a:hover { text-decoration: underline; }
   background: #fefce8;
   border: 1px solid #fde68a;
   color: #92400e;
+}
+
+.repro-nav-failed {
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  color: #9a3412;
+}
+
+.repro-inconclusive {
+  background: #fefce8;
+  border: 1px solid #fde68a;
+  color: #92400e;
+}
+
+.repro-assertions {
+  padding: 8px 16px;
+  font-size: 12px;
+}
+.repro-assert-item {
+  padding: 3px 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.repro-assert-item code {
+  background: var(--bg-secondary);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
 }
 
 .repro-fixed {
