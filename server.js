@@ -2082,8 +2082,17 @@ function handleRequest(req, res) {
     // GET /api/logs/prompts/:bugId — list prompt files for a bug
     var promptListMatch = pathname.match(/^\/api\/logs\/prompts\/([a-zA-Z0-9_]+)$/);
     if (promptListMatch && method === 'GET') {
-      var files = logger.listPromptFiles(promptListMatch[1]);
-      sendJSON(res, 200, { bugId: promptListMatch[1], files: files });
+      var promptBugId = promptListMatch[1];
+      var files = logger.listPromptFiles(promptBugId);
+      // Enrich with bug title from logs metadata
+      var logsList = logger.listLogs();
+      var bugMeta = (logsList.promptLogs || []).filter(function (p) { return p.bugId === promptBugId; })[0];
+      sendJSON(res, 200, {
+        bugId: promptBugId,
+        title: bugMeta ? bugMeta.title : '',
+        folder: bugMeta ? bugMeta.folder : promptBugId,
+        files: files
+      });
       return;
     }
 

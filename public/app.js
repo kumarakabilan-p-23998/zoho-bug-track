@@ -3429,18 +3429,26 @@
         return;
       }
 
+      // Update title with bug title if available
+      if (data.title) {
+        titleEl.textContent = 'AI Prompts & Responses — ' + data.title + ' (' + bugId + ')';
+      }
+
       var html = '';
       data.files.forEach(function (f, idx) {
-        var label = f.replace(/^(analyze_|fix_)/, '').replace(/_\d+\.txt$/, '');
-        if (f.indexOf('prompt') !== -1) label = '📤 ' + label;
-        else if (f.indexOf('response') !== -1) label = '📥 ' + label;
-        html += '<button class="log-prompt-file-btn' + (idx === 0 ? ' active' : '') + '" data-file="' + esc(f) + '">'
+        // f is an object: { name, label, type, size, timestamp }
+        var fileName = f.name || f;
+        var label = f.label || fileName;
+        var sizeStr = f.size ? ' (' + formatBytes(f.size) + ')' : '';
+        html += '<button class="log-prompt-file-btn' + (idx === 0 ? ' active' : '')
+          + '" data-file="' + esc(fileName) + '" title="' + esc(fileName + sizeStr) + '">'
           + esc(label) + '</button>';
       });
       filesEl.innerHTML = html;
 
       // Load first file
-      loadPromptFile(bugId, data.files[0], contentEl);
+      var firstName = data.files[0].name || data.files[0];
+      loadPromptFile(bugId, firstName, contentEl);
 
       // Bind clicks
       var btns = filesEl.querySelectorAll('.log-prompt-file-btn');
