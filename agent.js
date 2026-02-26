@@ -25,6 +25,8 @@ var url = require('url');
 var fs = require('fs');
 var path = require('path');
 var os = require('os');
+var patchUtils = require('./lib/patch-utils');
+var logger = require('./lib/logger');
 
 // ── CLI args ─────────────────────────────────────────────
 
@@ -2115,7 +2117,7 @@ function handleRequest(req, res) {
     return;
   }
 
-  // POST /write-file  { path, content }
+  // POST /write-file  { path, content } — legacy direct write, now with backup
   if (pathname === '/write-file' && req.method === 'POST') {
     readAgentBody(req, function (bodyErr, body) {
       if (bodyErr) { sendJSON(res, 400, { error: bodyErr.message }); return; }
@@ -2125,11 +2127,97 @@ function handleRequest(req, res) {
       if (!isInsideRoot(config.dir, fullPath)) {
         sendJSON(res, 403, { error: 'Path is outside project directory' }); return;
       }
+      // Create backup before overwriting
+      try { patchUtils.createBackup(config.dir, body.path); }
+      catch (e) { console.error('[agent] Backup failed:', e.message); }
       try {
         fs.writeFileSync(fullPath, body.content || '', 'utf-8');
         sendJSON(res, 200, { success: true, file: body.path });
       } catch (e) {
         sendJSON(res, 500, { error: 'Write failed: ' + e.message });
+      }
+    });
+    return;
+  }
+
+  // POST /apply-patch  { path, code, force } — smart patch-based modification with backup
+  if (pathname === '/apply-patch' && req.method === 'POST') {
+    readAgentBody(req, function (bodyErr, body) {
+      if (bodyErr) { sendJSON(res, 400, { error: bodyErr.message }); return; }
+      if (!body.path || !body.code) { sendJSON(res, 400, { error: 'Missing path or code' }); return; }
+      console.log('[agent] 🩹 Apply patch:', body.path);
+      var fullPath = path.resolve(config.dir, body.path);
+      if (!isInsideRoot(config.dir, fullPath)) {
+        sendJSON(res, 403, { error: 'Path is outside project directory' }); return;
+      }
+
+      // Read original file
+      var originalText = '';
+      var fileExists = fs.existsSync(fullPath);
+      if (fileExists) {
+        try { originalText = fs.readFileSync(fullPath, 'utf-8'); }
+        catch (e) { sendJSON(res, 500, { error: 'Cannot read file: ' + e.message }); return; }
+      }
+
+      // Compute smart merge
+      var mergeResult = patchUtils.applySmartMerge(originalText, body.code, {
+        fileName: body.path
+      });
+
+      // If merge failed and force is not set, return diff for review
+      if (!mergeResult.success && !body.force) {
+        sendJSON(res, 200, {
+          success: false,
+          needsReview: true,
+          file: body.path,
+          strategy: mergeResult.strategy,
+          diff: mergeResult.diff,
+          hunks: mergeResult.hunks,
+          applied: mergeResult.applied,
+          failed: mergeResult.failed,
+          details: mergeResult.details
+        });
+        return;
+      }
+
+      // Create backup before writing
+      if (fileExists) {
+        try { patchUtils.createBackup(config.dir, body.path); }
+        catch (e) { console.error('[agent] Backup failed:', e.message); }
+      }
+
+      // Write the merged result
+      try {
+        fs.writeFileSync(fullPath, mergeResult.result, 'utf-8');
+        sendJSON(res, 200, {
+          success: true,
+          file: body.path,
+          strategy: mergeResult.strategy,
+          diff: mergeResult.diff,
+          hunks: mergeResult.hunks,
+          applied: mergeResult.applied,
+          failed: mergeResult.failed,
+          details: mergeResult.details,
+          backup: true
+        });
+      } catch (e) {
+        sendJSON(res, 500, { error: 'Write failed: ' + e.message });
+      }
+    });
+    return;
+  }
+
+  // POST /revert-file  { path } — restore a file from its backup
+  if (pathname === '/revert-file' && req.method === 'POST') {
+    readAgentBody(req, function (bodyErr, body) {
+      if (bodyErr) { sendJSON(res, 400, { error: bodyErr.message }); return; }
+      if (!body.path) { sendJSON(res, 400, { error: 'Missing path' }); return; }
+      console.log('[agent] ↩️ Revert file:', body.path);
+      var result = patchUtils.restoreFromBackup(config.dir, body.path);
+      if (result.restored) {
+        sendJSON(res, 200, { success: true, file: body.path, message: 'Restored from backup' });
+      } else {
+        sendJSON(res, 200, { success: false, error: result.error });
       }
     });
     return;
@@ -2291,6 +2379,21 @@ function handleRequest(req, res) {
 
 var server = http.createServer(handleRequest);
 
+// Start logging session for agent
+logger.startSession({ component: 'agent', name: config.name, dir: config.dir, port: config.port });
+
+// Graceful shutdown
+process.on('SIGINT', function () {
+  logger.info('SYSTEM', 'Agent shutting down (SIGINT)');
+  logger.endSession();
+  process.exit(0);
+});
+process.on('SIGTERM', function () {
+  logger.info('SYSTEM', 'Agent shutting down (SIGTERM)');
+  logger.endSession();
+  process.exit(0);
+});
+
 server.listen(config.port, '0.0.0.0', function () {
   // Get local IP addresses
   var interfaces = os.networkInterfaces();
@@ -2320,6 +2423,7 @@ server.listen(config.port, '0.0.0.0', function () {
   console.log('║  Set this URL in the web UI → Settings → Agent URL        ║');
   console.log('╚═══════════════════════════════════════════════════════════╝');
   console.log('');
+  logger.info('SYSTEM', 'Agent started successfully', { port: config.port, dir: config.dir, name: config.name });
 });
 
 function pad(str, len) {

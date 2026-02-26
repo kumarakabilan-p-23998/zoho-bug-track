@@ -36,6 +36,8 @@ var bugService = require('./lib/bug-service');
 var codeAnalyzer = require('./lib/code-analyzer');
 var fixPrompt = require('./lib/fix-prompt');
 var agentProxy = require('./lib/agent-proxy');
+var patchUtils = require('./lib/patch-utils');
+var logger = require('./lib/logger');
 
 var PORT = envConfig.PORT;
 var PUBLIC_DIR = path.join(__dirname, 'public');
@@ -160,9 +162,11 @@ function handleRequest(req, res) {
 
     // Exchange code for tokens
     console.log('OAuth callback received, exchanging code...');
+    logger.info('AUTH', 'OAuth callback received, exchanging code');
     zohoAuth.exchangeCode(code, function (err, tokenData) {
       if (err) {
         console.error('TOKEN EXCHANGE FAILED:', err.message);
+        logger.error('AUTH', 'Token exchange failed', { error: err.message });
         res.writeHead(302, { 'Location': '/?error=' + encodeURIComponent(err.message) });
         res.end();
         return;
@@ -185,6 +189,7 @@ function handleRequest(req, res) {
           userName = firstUser.name || '';
           userEmail = firstUser.email || '';
           console.log('Logged in as:', userName, '(' + userEmail + ') ID:', userId);
+          logger.authEvent('login', userId, { name: userName, email: userEmail });
         } else {
           // Fallback: generate a stable ID from the refresh token (which stays constant for a given OAuth grant)
           console.log('Profile fetch failed, using fallback ID. Error:', profErr ? profErr.message : 'no data');
@@ -703,6 +708,11 @@ function handleRequest(req, res) {
         console.log('  Target route:', targetRoute || '(auto-detect)');
         console.log('  Time:', new Date().toLocaleTimeString());
         console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        logger.analyzeStart(analyzeMatch[1], userId, {
+          extraDescriptionLength: extraDescription.length,
+          targetRoute: targetRoute || '(auto-detect)',
+          includeImages: includeImages
+        });
         console.log('');
         console.log('[STEP 2/6] 🔍 Fetching bug details from Zoho...');
         var _analyzeStart = Date.now();
@@ -712,6 +722,14 @@ function handleRequest(req, res) {
           console.log('  Title:', (bugData.bug.title || '').substring(0, 80));
           console.log('  Status:', bugData.bug.status, '| Severity:', bugData.bug.severity);
           console.log('  Attachments:', (bugData.attachments || []).length, '| Comments:', (bugData.comments || []).length);
+          logger.bugFetched(analyzeMatch[1], {
+            title: bugData.bug.title || '',
+            status: bugData.bug.status,
+            severity: bugData.bug.severity,
+            module: bugData.bug.module || '',
+            attachmentCount: (bugData.attachments || []).length,
+            commentCount: (bugData.comments || []).length
+          }, Date.now() - _analyzeStart);
 
           // Download image attachments for vision analysis (optional, controlled by user toggle)
           var _bugImages = [];
@@ -751,6 +769,7 @@ function handleRequest(req, res) {
                     targetRoute = matchData.matchedRoute;
                     _parsedDesc = matchData.parsedDesc || null;
                     console.log('[AUTO-DETECT] ✅ Route detected:', targetRoute, '(method:', matchData.method + ', score:', matchData.score + ')');
+                    logger.routeDetected(analyzeMatch[1], targetRoute, matchData.method, matchData.score);
                   } else {
                     _parsedDesc = matchData.parsedDesc || null;
                     console.log('[AUTO-DETECT] ⚠️ No confident route match found (method:', matchData.method + ', score:', matchData.score + ')');
@@ -789,6 +808,12 @@ function handleRequest(req, res) {
             console.log('  File contents loaded:', result.analysis ? (result.analysis.fileContents || []).length : 0);
             console.log('  Prompt length:', result.prompt.length, 'chars');
             if (agentError) console.log('  ⚠️ Agent error:', agentError);
+            logger.codeScanComplete(analyzeMatch[1], {
+              relevantFiles: result.analysis ? result.analysis.relevantFiles : [],
+              codeMatches: result.analysis ? (result.analysis.codeMatches || []) : [],
+              fileContents: result.analysis ? (result.analysis.fileContents || []) : [],
+              prompt: result.prompt
+            }, Date.now() - _analyzeStart, analyzeUser.agentUrl);
             var copilotBridge = require('./lib/copilot-bridge-client');
             // Default to claude-opus-4-6 for best results via Copilot Bridge
             var aiModel = analyzeUser.aiModel || 'claude-opus-4-6';
@@ -806,6 +831,9 @@ function handleRequest(req, res) {
               console.log('  Total time:', ((Date.now() - _analyzeStart) / 1000).toFixed(1) + 's');
               console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
               console.log('');
+              logger.aiResponseReceived(analyzeMatch[1], aiResult, Date.now() - _analyzeStart, {
+                provider: aiResult._provider || 'unknown'
+              });
 
               // Save prompt log to agent if available
               var promptLogData = {
@@ -843,6 +871,7 @@ function handleRequest(req, res) {
               console.error('  Total time:', ((Date.now() - _analyzeStart) / 1000).toFixed(1) + 's');
               console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
               console.error('');
+              logger.aiError(analyzeMatch[1], errMsg, { model: aiModel });
               sendJSON(res, 200, {
                 prompt: result.prompt,
                 analysis: result.analysis,
@@ -961,13 +990,13 @@ function handleRequest(req, res) {
               lines.push('');
               lines.push('**Phase 1 — Setup:** Create a TEST entity first so there is something to act on.');
               lines.push('- Navigate to the create/add page for that entity.');
-              lines.push('- Fill required fields using test data. Use the prefix "__bugtrack_test_" for any name/label fields (e.g., "__bugtrack_test_svc_1").');
+              lines.push('- Fill required fields using test data. Use the prefix "bugtrack_test_" for any name/label fields (e.g., bugtrack_test_svc_1").');
               lines.push('- Submit/save and wait for creation to succeed.');
               lines.push('- Add an assert step to confirm the test entity now appears in the list.');
               lines.push('- Look at the HBS templates provided above to find the correct form fields, input selectors, and save button selectors.');
               lines.push('');
               lines.push('**Phase 2 — Action:** Perform the bug action on the TEST entity you just created.');
-              lines.push('- Find the test entity by its unique name (e.g., look for element containing "__bugtrack_test_").');
+              lines.push('- Find the test entity by its unique name (e.g., look for element containing "bugtrack_test_").');
               lines.push('- Perform the destructive action (click delete button, confirm dialog, etc.).');
               lines.push('');
               lines.push('**Phase 3 — Verify:** Assert the expected buggy behavior.');
@@ -1444,6 +1473,7 @@ function handleRequest(req, res) {
 
             // Run reproduction first, then AI analysis
             attemptReproduction(function (reproResult) {
+            logger.reproAttempt(analyzeMatch[1], reproResult);
 
             // If bug was NOT reproduced (assertions ran and passed), skip code fix
             if (reproResult && reproResult.attempted && !reproResult.bugConfirmed && !reproResult.reproduced &&
@@ -1508,9 +1538,15 @@ function handleRequest(req, res) {
             console.log('');
             console.log('[STEP 5/6] 🤖 Sending prompt to AI...');
             console.log('  Checking Copilot Bridge...');
+            logger.aiPromptSent(analyzeMatch[1], result.prompt, {
+              model: aiModel,
+              provider: 'pending',
+              imageCount: _bugImages.length
+            });
             copilotBridge.checkHealth(function (hErr, hData) {
               if (!hErr && hData && hData.ok) {
                 console.log('[STEP 5/6] ✅ Copilot Bridge available — sending to model:', aiModel);
+                logger.info('AI_PROMPT', 'Using Copilot Bridge', { bugId: analyzeMatch[1], model: aiModel, provider: 'copilot-bridge' });
                 if (_bugImages.length > 0) console.log('  Including', _bugImages.length, 'bug screenshot(s) for vision analysis');
                 copilotBridge.analyze(result.prompt, aiModel, { images: _bugImages }, function (bErr, bResult) {
                   if (!bErr) return sendFinalResponse(bResult, reproResult);
@@ -1667,7 +1703,153 @@ function handleRequest(req, res) {
       return;
     }
 
-    // POST /api/write-file
+    // POST /api/preview-diff — preview what changes will be applied (no write)
+    if (pathname === '/api/preview-diff' && method === 'POST') {
+      readBody(req, function (bodyErr, body) {
+        if (bodyErr) return send400(res, bodyErr.message);
+        if (!body.path || !body.code) return send400(res, 'Missing path or code');
+        var pdUser = userStore.getUser(userId);
+        var projectDir = pdUser.projectDir;
+        if (!projectDir) return send400(res, 'No project directory configured');
+
+        var filePath = path.resolve(projectDir, body.path);
+        if (filePath.indexOf(path.resolve(projectDir)) !== 0)
+          return send400(res, 'Path outside project');
+
+        // Read the original file
+        var originalText = '';
+        var fileExists = fs.existsSync(filePath);
+        if (fileExists) {
+          try { originalText = fs.readFileSync(filePath, 'utf-8'); }
+          catch (e) { return send500(res, 'Cannot read file: ' + e.message); }
+        }
+
+        // Compute the smart merge result (without writing)
+        var mergeResult = patchUtils.applySmartMerge(originalText, body.code, {
+          fileName: body.path
+        });
+
+        sendJSON(res, 200, {
+          file: body.path,
+          fileExists: fileExists,
+          originalLines: originalText.split('\n').length,
+          newLines: mergeResult.result.split('\n').length,
+          strategy: mergeResult.strategy,
+          diff: mergeResult.diff,
+          hunks: mergeResult.hunks,
+          applied: mergeResult.applied,
+          failed: mergeResult.failed,
+          details: mergeResult.details,
+          success: mergeResult.success
+        });
+      });
+      return;
+    }
+
+    // POST /api/apply-patch — smart patch-based file modification with backup
+    if (pathname === '/api/apply-patch' && method === 'POST') {
+      readBody(req, function (bodyErr, body) {
+        if (bodyErr) return send400(res, bodyErr.message);
+        if (!body.path || !body.code) return send400(res, 'Missing path or code');
+        var apUser = userStore.getUser(userId);
+        var projectDir = apUser.projectDir;
+
+        if (apUser.agentUrl) {
+          // For agent-based users, proxy to the agent's new patch endpoint
+          agentProxy.applyPatch(apUser.agentUrl, body.path, body.code, body.force).then(function (data) {
+            sendJSON(res, 200, data);
+          }).catch(function (err) { send500(res, 'Agent error: ' + err.message); });
+          return;
+        }
+
+        if (!projectDir) return send400(res, 'No project directory configured');
+
+        var filePath = path.resolve(projectDir, body.path);
+        if (filePath.indexOf(path.resolve(projectDir)) !== 0)
+          return send400(res, 'Path outside project');
+
+        // Read original file
+        var originalText = '';
+        var fileExists = fs.existsSync(filePath);
+        if (fileExists) {
+          try { originalText = fs.readFileSync(filePath, 'utf-8'); }
+          catch (e) { return send500(res, 'Cannot read file: ' + e.message); }
+        }
+
+        // Compute smart merge
+        var mergeResult = patchUtils.applySmartMerge(originalText, body.code, {
+          fileName: body.path
+        });
+
+        // If merge failed and force is not set, return the diff for review
+        if (!mergeResult.success && !body.force) {
+          return sendJSON(res, 200, {
+            success: false,
+            needsReview: true,
+            file: body.path,
+            strategy: mergeResult.strategy,
+            diff: mergeResult.diff,
+            hunks: mergeResult.hunks,
+            applied: mergeResult.applied,
+            failed: mergeResult.failed,
+            details: mergeResult.details
+          });
+        }
+
+        // Create backup before writing
+        var backupPath = null;
+        if (fileExists) {
+          try { backupPath = patchUtils.createBackup(projectDir, body.path); }
+          catch (e) { console.error('[patch] Backup failed:', e.message); }
+        }
+
+        // Write the merged result
+        try {
+          fs.writeFileSync(filePath, mergeResult.result, 'utf-8');
+          logger.patchOperation('apply', body.path, {
+            strategy: mergeResult.strategy,
+            hunksApplied: mergeResult.applied,
+            hunksTotal: mergeResult.hunks,
+            backupPath: backupPath || ''
+          });
+          sendJSON(res, 200, {
+            success: true,
+            file: body.path,
+            strategy: mergeResult.strategy,
+            diff: mergeResult.diff,
+            hunks: mergeResult.hunks,
+            applied: mergeResult.applied,
+            failed: mergeResult.failed,
+            details: mergeResult.details,
+            backup: backupPath ? true : false
+          });
+        } catch (e) {
+          send500(res, 'Write failed: ' + e.message);
+        }
+      });
+      return;
+    }
+
+    // POST /api/revert-file — restore a file from its backup
+    if (pathname === '/api/revert-file' && method === 'POST') {
+      readBody(req, function (bodyErr, body) {
+        if (bodyErr) return send400(res, bodyErr.message);
+        if (!body.path) return send400(res, 'Missing path');
+        var rvUser = userStore.getUser(userId);
+        if (!rvUser.projectDir) return send400(res, 'No project directory configured');
+
+        var result = patchUtils.restoreFromBackup(rvUser.projectDir, body.path);
+        logger.patchOperation('revert', body.path, result);
+        if (result.restored) {
+          sendJSON(res, 200, { success: true, file: body.path, message: 'Restored from backup' });
+        } else {
+          sendJSON(res, 200, { success: false, error: result.error });
+        }
+      });
+      return;
+    }
+
+    // POST /api/write-file — legacy direct write (kept for compatibility, now with backup)
     if (pathname === '/api/write-file' && method === 'POST') {
       readBody(req, function (bodyErr, body) {
         if (bodyErr) return send400(res, bodyErr.message);
@@ -1677,11 +1859,14 @@ function handleRequest(req, res) {
             sendJSON(res, 200, data);
           }).catch(function (err) { send500(res, 'Agent error: ' + err.message); });
         } else if (wfUser.projectDir) {
-          var wfPath = require('path').resolve(wfUser.projectDir, body.path);
-          if (wfPath.indexOf(require('path').resolve(wfUser.projectDir)) !== 0)
+          var wfPath = path.resolve(wfUser.projectDir, body.path);
+          if (wfPath.indexOf(path.resolve(wfUser.projectDir)) !== 0)
             return send400(res, 'Path outside project');
+          // Create backup before overwriting
+          try { patchUtils.createBackup(wfUser.projectDir, body.path); }
+          catch (e) { console.error('[write-file] Backup failed:', e.message); }
           try {
-            require('fs').writeFileSync(wfPath, body.content || '', 'utf-8');
+            fs.writeFileSync(wfPath, body.content || '', 'utf-8');
             sendJSON(res, 200, { success: true, file: body.path });
           } catch (e) { send500(res, 'Write failed: ' + e.message); }
         } else {
@@ -1864,6 +2049,65 @@ function handleRequest(req, res) {
       return;
     }
 
+    // ── Log Viewer API ──────────────────────────────────────
+
+    // GET /api/logs — list available log files
+    if (pathname === '/api/logs' && method === 'GET') {
+      var logList = logger.listLogs();
+      sendJSON(res, 200, logList);
+      return;
+    }
+
+    // GET /api/logs/query?type=session|daily&id=xxx&level=INFO&category=AI_PROMPT&bugId=xxx&search=xxx&limit=200&offset=0
+    if (pathname === '/api/logs/query' && method === 'GET') {
+      var logType = query.type || 'daily';
+      var logId = query.id || '';
+      if (!logId) {
+        // Default to today's daily log
+        var d = new Date();
+        logId = d.getFullYear() + '-' + (d.getMonth() + 1 < 10 ? '0' : '') + (d.getMonth() + 1) + '-' + (d.getDate() < 10 ? '0' : '') + d.getDate();
+      }
+      var logResult = logger.queryLogs(logType, logId, {
+        level: query.level || '',
+        category: query.category || '',
+        bugId: query.bugId || '',
+        search: query.search || '',
+        limit: query.limit || '200',
+        offset: query.offset || '0'
+      });
+      sendJSON(res, 200, logResult);
+      return;
+    }
+
+    // GET /api/logs/prompts/:bugId — list prompt files for a bug
+    var promptListMatch = pathname.match(/^\/api\/logs\/prompts\/([a-zA-Z0-9_]+)$/);
+    if (promptListMatch && method === 'GET') {
+      var files = logger.listPromptFiles(promptListMatch[1]);
+      sendJSON(res, 200, { bugId: promptListMatch[1], files: files });
+      return;
+    }
+
+    // GET /api/logs/prompts/:bugId/:fileName — read a specific prompt/response file
+    var promptFileMatch = pathname.match(/^\/api\/logs\/prompts\/([a-zA-Z0-9_]+)\/(.+)$/);
+    if (promptFileMatch && method === 'GET') {
+      var content = logger.readPromptFile(promptFileMatch[1], decodeURIComponent(promptFileMatch[2]));
+      if (content === null) return sendJSON(res, 404, { error: 'File not found' });
+      sendJSON(res, 200, { bugId: promptFileMatch[1], file: promptFileMatch[2], content: content });
+      return;
+    }
+
+    // GET /api/logs/session — get current session info
+    if (pathname === '/api/logs/session' && method === 'GET') {
+      var sStats = logger.getSessionStats();
+      sendJSON(res, 200, {
+        sessionId: logger.getSessionId(),
+        startedAt: sStats.startedAt || null,
+        stats: sStats,
+        logRoot: logger.getLogRoot()
+      });
+      return;
+    }
+
     // Not found API
     sendJSON(res, 404, { error: 'API endpoint not found: ' + pathname });
     return;
@@ -1889,6 +2133,21 @@ function handleRequest(req, res) {
 }
 
 // ── start server ─────────────────────────────────────────
+
+// Start logging session before server starts
+logger.startSession({ component: 'server', port: PORT });
+
+// Graceful shutdown: end logging session
+process.on('SIGINT', function () {
+  logger.info('SYSTEM', 'Server shutting down (SIGINT)');
+  logger.endSession();
+  process.exit(0);
+});
+process.on('SIGTERM', function () {
+  logger.info('SYSTEM', 'Server shutting down (SIGTERM)');
+  logger.endSession();
+  process.exit(0);
+});
 
 var server = http.createServer(handleRequest);
 
@@ -1921,4 +2180,5 @@ server.listen(PORT, '0.0.0.0', function () {
   console.log('║  Each person runs agent.js on their machine.     ║');
   console.log('╚══════════════════════════════════════════════════╝');
   console.log('');
+  logger.info('SYSTEM', 'Server started successfully', { port: PORT, addresses: addresses, logRoot: logger.getLogRoot() });
 });

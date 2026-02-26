@@ -226,6 +226,7 @@
     });
 
     bindEvents();
+    initLogViewer();
   }
 
   function showLogin() {
@@ -261,6 +262,8 @@
     tabContents.forEach(function (el) {
       el.classList.toggle('active', el.id === 'tab-' + tabName);
     });
+    // Auto-load logs when switching to Logs tab
+    if (tabName === 'logs') loadLogs();
   }
 
   // ── Events ─────────────────────────────────────────────
@@ -1225,21 +1228,38 @@
       }
       html += makeAccordion('ai', '\uD83E\uDDE0', 'AI Analysis', modelBadge, aiBody, { open: true });
 
-      // ── 3. Per-file diff accordions with Edit & Apply buttons ──
+      // ── 3. Per-file diff accordions with Edit, Preview, Apply & Revert buttons ──
       if (parsed.diffs.length > 0) {
         parsedDiffBlocks = parsed.diffs;
         parsed.diffs.forEach(function (diff, idx) {
           var diffBody = '<div class="acc-diff-body" id="acc-diff-view-' + idx + '">' + renderCodeDiff(diff.code, diff.lang) + '</div>';
+          // Preview diff area (hidden by default — shows actual file diff before applying)
+          diffBody += '<div class="acc-preview-area" id="acc-preview-area-' + idx + '" style="display:none;">';
+          diffBody += '<div class="acc-preview-header">';
+          diffBody += '<span class="acc-preview-title">Preview: Changes to be applied</span>';
+          diffBody += '<span class="acc-preview-strategy" id="acc-preview-strategy-' + idx + '"></span>';
+          diffBody += '</div>';
+          diffBody += '<div class="acc-preview-diff" id="acc-preview-diff-' + idx + '"></div>';
+          diffBody += '<div class="acc-preview-actions">';
+          diffBody += '<button class="btn btn-primary btn-sm" id="acc-confirm-btn-' + idx + '">Confirm &amp; Apply</button>';
+          diffBody += '<button class="btn btn-outline btn-sm" id="acc-force-btn-' + idx + '" style="display:none;">Force Apply (override)</button>';
+          diffBody += '<button class="btn btn-outline btn-sm" id="acc-cancel-preview-btn-' + idx + '">Cancel</button>';
+          diffBody += '</div>';
+          diffBody += '</div>';
           // Edit textarea (hidden by default)
           diffBody += '<div class="acc-edit-area" id="acc-edit-area-' + idx + '">';
           diffBody += '<textarea class="acc-edit-textarea" id="acc-edit-textarea-' + idx + '">' + esc(diff.code) + '</textarea>';
           diffBody += '</div>';
-          // Action bar: Edit, Apply, status
+          // Action bar: Edit, Preview, Apply, Revert, status
           diffBody += '<div class="acc-diff-actions">';
           diffBody += '<button class="btn btn-outline" id="acc-edit-btn-' + idx + '" data-idx="' + idx + '">';
           diffBody += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg> Edit</button>';
+          diffBody += '<button class="btn btn-outline" id="acc-preview-btn-' + idx + '" data-idx="' + idx + '" title="Preview changes against actual file">';
+          diffBody += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg> Preview</button>';
           diffBody += '<button class="btn btn-primary" id="acc-apply-btn-' + idx + '" data-idx="' + idx + '" data-file="' + esc(diff.file) + '">';
           diffBody += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg> Apply</button>';
+          diffBody += '<button class="btn btn-outline btn-danger" id="acc-revert-btn-' + idx + '" data-idx="' + idx + '" style="display:none;" title="Revert to backup">';
+          diffBody += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> Revert</button>';
           diffBody += '<span class="acc-action-status" id="acc-status-' + idx + '"></span>';
           diffBody += '</div>';
 
@@ -1286,12 +1306,16 @@
       });
     });
 
-    // Wire Edit / Apply buttons for each diff
+    // Wire Edit / Preview / Apply / Revert buttons for each diff
     parsedDiffBlocks.forEach(function (diff, idx) {
       var editBtn = document.getElementById('acc-edit-btn-' + idx);
+      var previewBtn = document.getElementById('acc-preview-btn-' + idx);
       var applyBtn = document.getElementById('acc-apply-btn-' + idx);
+      var revertBtn = document.getElementById('acc-revert-btn-' + idx);
       if (editBtn) editBtn.addEventListener('click', function () { toggleDiffEdit(idx); });
+      if (previewBtn) previewBtn.addEventListener('click', function () { previewDiffFile(idx); });
       if (applyBtn) applyBtn.addEventListener('click', function () { applyDiffFile(idx); });
+      if (revertBtn) revertBtn.addEventListener('click', function () { revertDiffFile(idx); });
     });
 
     // Wire commit bar button
@@ -1336,10 +1360,101 @@
   }
 
   // Apply a diff block's code to the file on disk
-  function applyDiffFile(idx) {
+  // Preview what changes will be applied to the actual file on disk
+  function previewDiffFile(idx) {
+    var diff = parsedDiffBlocks[idx];
+    if (!diff) return;
+    var previewBtn = document.getElementById('acc-preview-btn-' + idx);
+    var previewArea = document.getElementById('acc-preview-area-' + idx);
+    var previewDiffEl = document.getElementById('acc-preview-diff-' + idx);
+    var strategyEl = document.getElementById('acc-preview-strategy-' + idx);
+    var confirmBtn = document.getElementById('acc-confirm-btn-' + idx);
+    var forceBtn = document.getElementById('acc-force-btn-' + idx);
+    var cancelBtn = document.getElementById('acc-cancel-preview-btn-' + idx);
+    var statusEl = document.getElementById('acc-status-' + idx);
+    var textarea = document.getElementById('acc-edit-textarea-' + idx);
+    var code = textarea ? textarea.value : diff.code;
+
+    // Close edit mode if open
+    var editArea = document.getElementById('acc-edit-area-' + idx);
+    if (editArea && editArea.classList.contains('open')) {
+      toggleDiffEdit(idx);
+    }
+
+    previewBtn.disabled = true;
+    previewBtn.innerHTML = '<span class="spinner"></span> Loading\u2026';
+    statusEl.textContent = '';
+
+    apiPost('/api/preview-diff', { path: diff.file, code: code }, function (status, data) {
+      previewBtn.disabled = false;
+      previewBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg> Preview';
+
+      if (status !== 200 || !data) {
+        statusEl.textContent = '\u2717 Preview failed';
+        statusEl.className = 'acc-action-status error';
+        return;
+      }
+
+      // Show preview area
+      previewArea.style.display = 'block';
+
+      // Strategy badge
+      var strategyLabels = {
+        'patch': '\uD83E\uDE79 Unified Diff Patch',
+        'line-patch': '\uD83D\uDCC4 Line-Level Patch',
+        'snippet-patch': '\u2702\uFE0F Snippet Patch',
+        'fallback': '\u26A0\uFE0F Unresolved \u2014 Review Required',
+        'no-change': '\u2705 No Changes'
+      };
+      strategyEl.textContent = strategyLabels[data.strategy] || data.strategy;
+      strategyEl.className = 'acc-preview-strategy' + (data.success ? '' : ' warning');
+
+      // Render the actual diff against the file on disk
+      if (data.diff) {
+        previewDiffEl.innerHTML = renderCodeDiff(data.diff, 'diff');
+      } else {
+        previewDiffEl.innerHTML = '<div class="acc-preview-empty">No changes detected \u2014 the file already matches.</div>';
+      }
+
+      // Show/hide force button based on success
+      if (!data.success && data.strategy === 'fallback') {
+        forceBtn.style.display = '';
+        confirmBtn.style.display = 'none';
+        statusEl.textContent = '\u26A0\uFE0F ' + (data.details && data.details[0] ? data.details[0].reason : 'Merge needs review');
+        statusEl.className = 'acc-action-status warning';
+      } else if (data.strategy === 'no-change') {
+        forceBtn.style.display = 'none';
+        confirmBtn.style.display = 'none';
+      } else {
+        forceBtn.style.display = 'none';
+        confirmBtn.style.display = '';
+      }
+
+      // Wire confirm button
+      confirmBtn.onclick = function () {
+        previewArea.style.display = 'none';
+        applyDiffFile(idx, false);
+      };
+
+      // Wire force button
+      forceBtn.onclick = function () {
+        previewArea.style.display = 'none';
+        applyDiffFile(idx, true);
+      };
+
+      // Wire cancel button
+      cancelBtn.onclick = function () {
+        previewArea.style.display = 'none';
+      };
+    });
+  }
+
+  // Apply a diff using the smart patch endpoint (with backup)
+  function applyDiffFile(idx, force) {
     var diff = parsedDiffBlocks[idx];
     if (!diff) return;
     var applyBtn = document.getElementById('acc-apply-btn-' + idx);
+    var revertBtn = document.getElementById('acc-revert-btn-' + idx);
     var statusEl = document.getElementById('acc-status-' + idx);
     var textarea = document.getElementById('acc-edit-textarea-' + idx);
     var code = textarea ? textarea.value : diff.code;
@@ -1355,20 +1470,69 @@
     statusEl.textContent = '';
     statusEl.className = 'acc-action-status';
 
-    apiPost('/api/write-file', { path: diff.file, content: code }, function (status, data) {
+    apiPost('/api/apply-patch', { path: diff.file, code: code, force: !!force }, function (status, data) {
       applyBtn.disabled = false;
       applyBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg> Apply';
 
       if (status === 200 && data && data.success) {
-        statusEl.textContent = '\u2713 Applied';
+        var strategyLabel = data.strategy === 'patch' ? 'patched' :
+                            data.strategy === 'snippet-patch' ? 'snippet-patched' :
+                            data.strategy === 'line-patch' ? 'line-patched' : 'applied';
+        statusEl.textContent = '\u2713 Applied (' + strategyLabel + ', ' + (data.hunks || 0) + ' hunk' + (data.hunks !== 1 ? 's' : '') + ')';
         statusEl.className = 'acc-action-status';
+        // Show revert button
+        if (revertBtn && data.backup) {
+          revertBtn.style.display = '';
+        }
         // Track applied file
         if (appliedDiffFiles.indexOf(diff.file) === -1) {
           appliedDiffFiles.push(diff.file);
         }
         updateCommitBar();
+        // Update the diff view to show the actual applied diff
+        if (data.diff) {
+          var diffView = document.getElementById('acc-diff-view-' + idx);
+          if (diffView) diffView.innerHTML = renderCodeDiff(data.diff, 'diff');
+        }
+      } else if (status === 200 && data && data.needsReview) {
+        // Merge couldn't auto-resolve — show preview for user to review
+        statusEl.textContent = '\u26A0\uFE0F Needs review \u2014 click Preview to see changes';
+        statusEl.className = 'acc-action-status warning';
+        // Auto-open preview
+        previewDiffFile(idx);
       } else {
-        statusEl.textContent = '\u2717 ' + (data ? data.error : 'Failed');
+        statusEl.textContent = '\u2717 ' + (data ? (data.error || 'Failed') : 'Failed');
+        statusEl.className = 'acc-action-status error';
+      }
+    });
+  }
+
+  // Revert a file to its pre-patch backup
+  function revertDiffFile(idx) {
+    var diff = parsedDiffBlocks[idx];
+    if (!diff) return;
+    var revertBtn = document.getElementById('acc-revert-btn-' + idx);
+    var statusEl = document.getElementById('acc-status-' + idx);
+
+    if (!confirm('Revert ' + diff.file + ' to the backup created before patching?')) return;
+
+    revertBtn.disabled = true;
+    revertBtn.innerHTML = '<span class="spinner"></span> Reverting\u2026';
+
+    apiPost('/api/revert-file', { path: diff.file }, function (status, data) {
+      revertBtn.disabled = false;
+      revertBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> Revert';
+
+      if (status === 200 && data && data.success) {
+        statusEl.textContent = '\u21A9\uFE0F Reverted to backup';
+        statusEl.className = 'acc-action-status';
+        revertBtn.style.display = 'none';
+        // Remove from applied files list
+        var fileIdx = appliedDiffFiles.indexOf(diff.file);
+        if (fileIdx !== -1) appliedDiffFiles.splice(fileIdx, 1);
+        updateCommitBar();
+      } else {
+        statusEl.textContent = '\u2717 Revert failed: ' + (data ? (data.error || 'Unknown') : 'Failed');
         statusEl.className = 'acc-action-status error';
       }
     });
@@ -1543,8 +1707,19 @@
 
   /**
    * Parse the AI response text to separate explanation from file-specific code blocks.
-   * ALL code blocks are treated as diffs/changes for this bug — the AI was asked
-   * specifically about this bug, so every code block is a suggested change.
+   *
+   * Only code blocks with a REAL file path are treated as applicable fixes.
+   * Code blocks without a file path (examples, explanations) stay as explanation text.
+   *
+   * File detection priority:
+   *   1. **FILE: `path/to/file.ext`** header line immediately above the code block
+   *   2. `// file: path/to/file.ext` comment as first line inside the code block
+   *   3. Lookback: scan preceding 4 lines for a file path reference (backticks, bold, etc.)
+   *   4. If no real file path found → treat as explanation (NOT a diff)
+   *
+   * "Before" code blocks (preceded by words like "currently", "existing", "before",
+   * "original", "broken") are also kept as explanation, not diffs.
+   *
    * Returns { explanation: string, diffs: [{ file, lang, code }] }
    */
   function parseAIResponse(text) {
@@ -1554,6 +1729,19 @@
     var explanationParts = [];
     var lines = text.split('\n');
     var i = 0;
+
+    // Track the earliest explanationParts index available for lookback.
+    // After a code block is accepted as a diff, all preceding explanation lines
+    // are "consumed" — they should NOT be re-used for the next code block's lookback.
+    var lookbackFloor = 0;
+
+    // Patterns that indicate a line references a real file path
+    // Must contain a `/` (path separator) or be a known project extension with path-like structure
+    var realFilePathPattern = /(?:\/|\\|^)[\w.@-]+(?:\/[\w.@-]+)+\.\w{1,5}$/;
+
+    // Words/phrases preceding a code block that indicate it's a "before" or explanatory example
+    // These match when the PRECEDING line has no file path, suggesting the block is explanatory
+    var beforePatterns = /\b(current(?:ly)|existing\s+code|before\s+(?:the\s+)?(?:fix|change)|original\s+code|broken\s+code|buggy|problematic|here\s+is\s+(?:an?\s+)?(?:example|test|demo))\b/i;
 
     while (i < lines.length) {
       var line = lines[i];
@@ -1575,45 +1763,117 @@
 
         var codeBlock = codeLines.join('\n');
 
-        // Determine the file name from surrounding context
+        // ── Determine the file name ──
         var fileName = '';
+        var isBeforeBlock = false;
 
-        // 1. Look at the lines just above the code block for a file reference
-        for (var lookback = explanationParts.length - 1; lookback >= Math.max(0, explanationParts.length - 4); lookback--) {
+        // Strategy 1: Look for **FILE: `path/file.ext`** header in preceding lines
+        // Only look at lines AFTER lookbackFloor (lines before it were consumed by previous blocks)
+        for (var lookback = explanationParts.length - 1; lookback >= Math.max(lookbackFloor, explanationParts.length - 3); lookback--) {
           var prevLine = explanationParts[lookback] || '';
-          if (!prevLine.trim()) continue; // skip blank lines
-
-          // Match patterns: **`path/file.js`**, `path/file.js`:, In file.js, ### file.js, path/file.ext:
-          var fileMatch = prevLine.match(/[`*"']([^\s`*"']+\.\w{1,5})[`*"']/i) ||
-                          prevLine.match(/(?:^|\s)([^\s:,()]+\.\w{1,5})\s*[:)]\s*$/i) ||
-                          prevLine.match(/(?:file|in|modify|update|edit|change|create|open)\s+[`*"']?([^\s`*"':,]+\.\w{1,5})[`*"']?/i) ||
-                          prevLine.match(/^#+\s+(?:\d+\.\s+)?[`*"']?([^\s`*"':,]+\.\w{1,5})[`*"']?/i);
-          if (fileMatch) {
-            fileName = fileMatch[1];
+          if (!prevLine.trim()) continue;
+          // Match: **FILE: `path/to/file.js`**  or  FILE: `path/to/file.js`  or  **FILE: path/to/file.js**
+          var fileHeaderMatch = prevLine.match(/\*?\*?FILE:\s*[`*"']?([^\s`*"']+\.\w{1,5})[`*"']?\*?\*?/i);
+          if (fileHeaderMatch) {
+            fileName = fileHeaderMatch[1];
             break;
           }
         }
 
-        // 2. Check first line of code for file hints (// file: path/to/file.js)
+        // Strategy 2: Check first line of code for file comment (// file: path/to/file.js)
         if (!fileName && codeLines.length > 0) {
-          var firstLineMatch = codeLines[0].match(/^(?:\/\/|#|\/\*|<!--)\s*(?:file|path)?:?\s*([^\s*>]+\.\w{1,5})/i);
-          if (firstLineMatch) fileName = firstLineMatch[1];
+          var firstLineMatch = codeLines[0].match(/^(?:\/\/|#|\/\*|<!--)\s*(?:file|path)\s*:?\s*([^\s*>]+\.\w{1,5})/i);
+          if (firstLineMatch) {
+            fileName = firstLineMatch[1];
+            // Remove the file comment from the code since it's metadata, not code
+            codeLines = codeLines.slice(1);
+            codeBlock = codeLines.join('\n');
+          }
         }
 
-        // 3. Infer from language if nothing else
+        // Strategy 3: Lookback — scan preceding non-blank lines for any file path reference
         if (!fileName) {
-          var extMap = { js: '.js', javascript: '.js', hbs: '.hbs', handlebars: '.hbs', css: '.css', java: '.java', json: '.json', xml: '.xml', ts: '.ts', typescript: '.ts', html: '.html', diff: '' };
-          var ext = extMap[lang.toLowerCase()] || '';
-          fileName = ext ? ('change' + (diffs.length + 1) + ext) : ('code block ' + (diffs.length + 1));
+          for (var lb = explanationParts.length - 1; lb >= Math.max(lookbackFloor, explanationParts.length - 4); lb--) {
+            var pl = explanationParts[lb] || '';
+            if (!pl.trim()) continue;
+
+            // Try to match a file path FIRST (takes priority over before-pattern)
+            // Match patterns: **`path/file.js`**, `path/file.js`:, In file.js, ### file.js
+            var fMatch = pl.match(/[`*"']([^\s`*"']+\/[^\s`*"']+\.\w{1,5})[`*"']/i) ||
+                         pl.match(/(?:file|in|modify|update|edit|change)\s+[`*"']?([^\s`*"':,]+\/[^\s`*"':,]+\.\w{1,5})[`*"']?/i) ||
+                         pl.match(/^#+\s+(?:\d+\.\s+)?[`*"']?([^\s`*"':,]+\/[^\s`*"':,]+\.\w{1,5})[`*"']?/i);
+            if (fMatch) {
+              fileName = fMatch[1];
+              break;
+            }
+
+            // Only THEN check if this line indicates a "before" example
+            if (beforePatterns.test(pl)) {
+              isBeforeBlock = true;
+              break;
+            }
+          }
         }
 
-        // Every code block from the AI is a suggested change for this bug
-        var hasDiffMarkers = /^[+-] /m.test(codeBlock) || /^[+-]\t/m.test(codeBlock) || /^@@/m.test(codeBlock);
-        diffs.push({
-          file: fileName,
-          lang: hasDiffMarkers ? 'diff' : (lang || 'code'),
-          code: codeBlock
-        });
+        // Strategy 4: If no real file path found, check if this is a unified diff (always useful)
+        var hasDiffMarkers = /^[+-]{3}\s/m.test(codeBlock) || /^@@\s*[+-]/m.test(codeBlock);
+        if (!fileName && hasDiffMarkers) {
+          // Try extracting file from the diff headers (--- a/file  +++ b/file)
+          var diffFileMatch = codeBlock.match(/^\+\+\+\s+[ab]\/(.+)$/m) ||
+                              codeBlock.match(/^---\s+[ab]\/(.+)$/m);
+          if (diffFileMatch) {
+            fileName = diffFileMatch[1];
+          }
+        }
+
+        // ── Decision: Is this an applicable fix or just explanation? ──
+        if (isBeforeBlock || !fileName) {
+          // No real file path or it's a "before" example → keep as explanation
+          explanationParts.push('```' + (lang || ''));
+          for (var cl = 0; cl < codeLines.length; cl++) {
+            explanationParts.push(codeLines[cl]);
+          }
+          explanationParts.push('```');
+          continue;
+        }
+
+        // Clean up the file path — strip leading markdown artifacts
+        fileName = fileName.replace(/^[`*"']+|[`*"']+$/g, '').trim();
+
+        // Validate: must look like a real path (contains a / or is a known project file pattern)
+        if (!realFilePathPattern.test(fileName) && !/\.\w{1,5}$/.test(fileName)) {
+          // Doesn't look like a real file → explanation
+          explanationParts.push('```' + (lang || ''));
+          for (var cl2 = 0; cl2 < codeLines.length; cl2++) {
+            explanationParts.push(codeLines[cl2]);
+          }
+          explanationParts.push('```');
+          continue;
+        }
+
+        // Check if we already have a diff for this same file — merge if so
+        var existingIdx = -1;
+        for (var di = 0; di < diffs.length; di++) {
+          if (diffs[di].file === fileName) {
+            existingIdx = di;
+            break;
+          }
+        }
+
+        if (existingIdx >= 0 && !hasDiffMarkers) {
+          // Merge: append the new code block to the existing one
+          // (AI sometimes gives multiple code blocks for the same file)
+          diffs[existingIdx].code += '\n\n' + codeBlock;
+        } else {
+          diffs.push({
+            file: fileName,
+            lang: hasDiffMarkers ? 'diff' : (lang || 'code'),
+            code: codeBlock
+          });
+        }
+        // Mark preceding explanation lines as consumed so future
+        // lookbacks don't re-match a FILE: header meant for this block
+        lookbackFloor = explanationParts.length;
         continue;
       }
 
@@ -2930,6 +3190,292 @@
     var sizes = ['B', 'KB', 'MB', 'GB'];
     var i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+  }
+
+  // ── Log Viewer ──────────────────────────────────────────
+
+  var logState = {
+    source: 'session',   // 'session' or 'daily'
+    level: '',
+    category: '',
+    search: '',
+    bugId: '',
+    page: 0,
+    limit: 100,
+    entries: [],
+    total: 0,
+    sessionInfo: null
+  };
+
+  function initLogViewer() {
+    var refreshBtn   = $('#log-refresh-btn');
+    var exportBtn    = $('#log-export-btn');
+    var sourceSelect = $('#log-source-select');
+    var levelSelect  = $('#log-level-select');
+    var catSelect    = $('#log-category-select');
+    var searchInput  = $('#log-search-input');
+    var bugInput     = $('#log-bug-filter');
+    var prevBtn      = $('#log-prev-btn');
+    var nextBtn      = $('#log-next-btn');
+    var promptClose  = $('#log-prompt-close');
+
+    if (!refreshBtn) return; // tab not in DOM
+
+    refreshBtn.addEventListener('click', function () { loadLogs(); });
+    exportBtn.addEventListener('click', exportLogs);
+
+    sourceSelect.addEventListener('change', function () {
+      logState.source = this.value; logState.page = 0; loadLogs();
+    });
+    levelSelect.addEventListener('change', function () {
+      logState.level = this.value; logState.page = 0; loadLogs();
+    });
+    catSelect.addEventListener('change', function () {
+      logState.category = this.value; logState.page = 0; loadLogs();
+    });
+
+    var searchTimer = null;
+    searchInput.addEventListener('input', function () {
+      clearTimeout(searchTimer);
+      var val = this.value;
+      searchTimer = setTimeout(function () {
+        logState.search = val; logState.page = 0; loadLogs();
+      }, 400);
+    });
+
+    bugInput.addEventListener('input', function () {
+      clearTimeout(searchTimer);
+      var val = this.value;
+      searchTimer = setTimeout(function () {
+        logState.bugId = val; logState.page = 0; loadLogs();
+      }, 400);
+    });
+
+    prevBtn.addEventListener('click', function () {
+      if (logState.page > 0) { logState.page--; loadLogs(); }
+    });
+    nextBtn.addEventListener('click', function () {
+      if ((logState.page + 1) * logState.limit < logState.total) {
+        logState.page++; loadLogs();
+      }
+    });
+
+    promptClose.addEventListener('click', function () {
+      $('#log-prompt-viewer').style.display = 'none';
+    });
+  }
+
+  function loadLogs() {
+    var type = logState.source;
+    var params = '?type=' + type;
+
+    // For session logs, get current session id first
+    if (type === 'session') {
+      apiGet('/api/logs/session', function (status, data) {
+        if (status !== 200 || !data || !data.sessionId) {
+          renderSessionBar(null);
+          renderLogTable([]);
+          return;
+        }
+        logState.sessionInfo = data;
+        renderSessionBar(data);
+        fetchLogEntries(type, data.sessionId);
+      });
+    } else {
+      // Daily — use today's date as id
+      var today = new Date().toISOString().slice(0, 10);
+      logState.sessionInfo = null;
+      renderSessionBar(null);
+      fetchLogEntries(type, today);
+    }
+  }
+
+  function fetchLogEntries(type, id) {
+    var url = '/api/logs/query?type=' + type + '&id=' + encodeURIComponent(id)
+      + '&limit=' + logState.limit + '&offset=' + (logState.page * logState.limit);
+    if (logState.level) url += '&level=' + logState.level;
+    if (logState.category) url += '&category=' + logState.category;
+    if (logState.search) url += '&search=' + encodeURIComponent(logState.search);
+    if (logState.bugId) url += '&bugId=' + encodeURIComponent(logState.bugId);
+
+    apiGet(url, function (status, data) {
+      if (status !== 200 || !data) {
+        logState.entries = []; logState.total = 0;
+        renderLogTable([]);
+        return;
+      }
+      logState.entries = data.entries || [];
+      logState.total = data.total || logState.entries.length;
+      renderLogTable(logState.entries);
+      renderLogPagination();
+    });
+  }
+
+  function renderSessionBar(info) {
+    var barEl = $('#log-session-bar');
+    var idEl = $('#log-session-id');
+    var metaEl = $('#log-session-info');
+    if (!info) {
+      barEl.style.display = 'none';
+      return;
+    }
+    barEl.style.display = 'flex';
+    idEl.textContent = 'Session: ' + (info.sessionId || '').substring(0, 12);
+    var parts = [];
+    if (info.startedAt) parts.push('Started: ' + new Date(info.startedAt).toLocaleString());
+    if (info.stats) {
+      var s = info.stats;
+      parts.push('Entries: ' + (s.total || 0));
+      if (s.errors) parts.push('Errors: ' + s.errors);
+      if (s.aiCalls) parts.push('AI Calls: ' + s.aiCalls);
+    }
+    metaEl.textContent = parts.join('  •  ');
+  }
+
+  function renderLogTable(entries) {
+    var tbody = $('#log-table-body');
+    var countEl = $('#log-count');
+    if (!tbody) return;
+
+    countEl.textContent = logState.total || entries.length;
+
+    if (!entries || entries.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty-cell">No log entries found</td></tr>';
+      return;
+    }
+
+    var html = '';
+    entries.forEach(function (entry) {
+      var ts = entry.ts ? new Date(entry.ts) : null;
+      var timeStr = ts ? ts.toLocaleTimeString('en-GB', { hour12: false }) + '.' + String(ts.getMilliseconds()).padStart(3, '0') : '—';
+      var level = entry.level || 'INFO';
+      var cat = entry.cat || '';
+      var msg = esc(entry.msg || '');
+      var isAI = cat === 'AI_PROMPT' || cat === 'AI_RESPONSE';
+      var rowClass = isAI && entry.bugId ? ' class="log-row-clickable"' : '';
+      var dataStr = '';
+
+      // Build condensed data display
+      var d = entry.d || {};
+      var dataKeys = Object.keys(d);
+      if (entry.bugId) dataKeys.unshift('bugId:' + entry.bugId);
+      if (entry.model) dataKeys.unshift('model:' + entry.model);
+      if (entry.duration) dataKeys.unshift(entry.duration + 'ms');
+      if (entry.error) dataKeys.unshift('ERR:' + entry.error.substring(0, 40));
+
+      // Compact data representation
+      var dataParts = [];
+      if (entry.duration) dataParts.push(entry.duration + 'ms');
+      if (entry.model) dataParts.push(entry.model);
+      if (entry.bugId) dataParts.push('bug:' + entry.bugId);
+      if (entry.error) dataParts.push('err:' + entry.error.substring(0, 30));
+      var dk = Object.keys(d);
+      for (var i = 0; i < Math.min(dk.length, 3); i++) {
+        var val = d[dk[i]];
+        if (typeof val === 'object') val = JSON.stringify(val).substring(0, 30);
+        else val = String(val).substring(0, 30);
+        dataParts.push(dk[i] + ':' + val);
+      }
+      dataStr = esc(dataParts.join(' | '));
+
+      html += '<tr' + rowClass
+        + (isAI && entry.bugId ? ' data-bug-id="' + esc(entry.bugId) + '"' : '')
+        + '>'
+        + '<td class="log-time">' + timeStr + '</td>'
+        + '<td><span class="log-level-badge log-level-' + level + '">' + level + '</span></td>'
+        + '<td class="log-cat">' + cat + '</td>'
+        + '<td class="log-msg">' + msg + '</td>'
+        + '<td class="log-data">' + dataStr + '</td>'
+        + '</tr>';
+    });
+
+    tbody.innerHTML = html;
+
+    // Bind click handlers for AI rows → prompt viewer
+    var clickableRows = tbody.querySelectorAll('.log-row-clickable');
+    clickableRows.forEach(function (row) {
+      row.addEventListener('click', function () {
+        var bugId = row.getAttribute('data-bug-id');
+        if (bugId) showPromptViewer(bugId);
+      });
+    });
+  }
+
+  function renderLogPagination() {
+    var prevBtn = $('#log-prev-btn');
+    var nextBtn = $('#log-next-btn');
+    var pageInfo = $('#log-page-info');
+
+    var totalPages = Math.max(1, Math.ceil(logState.total / logState.limit));
+    pageInfo.textContent = 'Page ' + (logState.page + 1) + ' of ' + totalPages;
+    prevBtn.disabled = logState.page <= 0;
+    nextBtn.disabled = (logState.page + 1) >= totalPages;
+  }
+
+  function showPromptViewer(bugId) {
+    var viewer = $('#log-prompt-viewer');
+    var titleEl = $('#log-prompt-title');
+    var filesEl = $('#log-prompt-files');
+    var contentEl = $('#log-prompt-content');
+
+    titleEl.textContent = 'AI Prompts & Responses — Bug ' + bugId;
+    filesEl.innerHTML = '<span style="color:var(--text-muted);font-size:12px;">Loading…</span>';
+    contentEl.textContent = '';
+    viewer.style.display = 'block';
+
+    apiGet('/api/logs/prompts/' + encodeURIComponent(bugId), function (status, data) {
+      if (status !== 200 || !data || !data.files || data.files.length === 0) {
+        filesEl.innerHTML = '<span style="color:var(--text-muted);font-size:12px;">No prompt files found for this bug.</span>';
+        return;
+      }
+
+      var html = '';
+      data.files.forEach(function (f, idx) {
+        var label = f.replace(/^(analyze_|fix_)/, '').replace(/_\d+\.txt$/, '');
+        if (f.indexOf('prompt') !== -1) label = '📤 ' + label;
+        else if (f.indexOf('response') !== -1) label = '📥 ' + label;
+        html += '<button class="log-prompt-file-btn' + (idx === 0 ? ' active' : '') + '" data-file="' + esc(f) + '">'
+          + esc(label) + '</button>';
+      });
+      filesEl.innerHTML = html;
+
+      // Load first file
+      loadPromptFile(bugId, data.files[0], contentEl);
+
+      // Bind clicks
+      var btns = filesEl.querySelectorAll('.log-prompt-file-btn');
+      btns.forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          btns.forEach(function (b) { b.classList.remove('active'); });
+          btn.classList.add('active');
+          loadPromptFile(bugId, btn.getAttribute('data-file'), contentEl);
+        });
+      });
+    });
+  }
+
+  function loadPromptFile(bugId, fileName, contentEl) {
+    contentEl.textContent = 'Loading…';
+    apiGet('/api/logs/prompts/' + encodeURIComponent(bugId) + '/' + encodeURIComponent(fileName), function (status, data) {
+      if (status !== 200 || !data) {
+        contentEl.textContent = 'Failed to load file.';
+        return;
+      }
+      contentEl.textContent = data.content || data.text || '(empty)';
+    });
+  }
+
+  function exportLogs() {
+    if (!logState.entries || logState.entries.length === 0) return;
+    var text = logState.entries.map(function (e) {
+      return JSON.stringify(e);
+    }).join('\n');
+    var blob = new Blob([text], { type: 'application/x-ndjson' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'logs-' + new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-') + '.jsonl';
+    a.click();
+    URL.revokeObjectURL(a.href);
   }
 
   // ── Boot ───────────────────────────────────────────────
