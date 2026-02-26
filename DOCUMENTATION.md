@@ -812,11 +812,13 @@ code --install-extension copilot-bridge-1.0.0.vsix
 |------|----------|--------|
 | User configs | `data/users/user_{hash}.json` | JSON |
 | Sessions | `data/sessions.json` | JSON |
-| Saved prompts | `data/agent-data/prompts/bug_{id}.json` | JSON |
 | Agent settings | `~/.zoho-bug-track/settings.json` | JSON |
 | Session logs | `~/Documents/.zoho-bug-track-logs/sessions/` | JSONL |
 | Daily logs | `~/Documents/.zoho-bug-track-logs/daily/` | JSONL |
 | Bug prompt logs | `~/Documents/.zoho-bug-track-logs/bugs/` | TXT |
+| Repro scripts | `~/Documents/.zoho-bug-track-logs/reproductions/bug_{id}_repro.js` | JS |
+| Repro screenshots | `~/Documents/.zoho-bug-track-logs/reproductions/bug_{id}_screenshot.png` | PNG |
+| Saved prompts | `~/Documents/.zoho-bug-track-logs/reproductions/bug_{id}.json` | JSON |
 | File backups | `~/Documents/.zoho-bug-track-backups/` | Raw copies |
 
 ### User Config Schema

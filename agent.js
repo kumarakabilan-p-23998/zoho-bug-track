@@ -331,17 +331,37 @@ var childProcess = require('child_process');
 // Uses the zoho-bug-track tool's own directory instead.
 
 var BUG_TRACKER_DATA_DIR = path.join(__dirname, 'data', 'agent-data');
-var PROMPTS_DIR = path.join(BUG_TRACKER_DATA_DIR, 'prompts');
+
+// Reproductions & prompt logs → ~/Documents/.zoho-bug-track-logs/reproductions/
+// Co-located with the logger output for a single, well-structured Documents folder.
+var _docsDir = path.join(os.homedir(), 'Documents');
+if (!fs.existsSync(_docsDir)) _docsDir = os.homedir();
+var LOG_ROOT = path.join(_docsDir, '.zoho-bug-track-logs');
+var PROMPTS_DIR = path.join(LOG_ROOT, 'reproductions');
+
 // Settings stored OUTSIDE repo — in user home dir to avoid pushing credentials
 var SETTINGS_DIR = path.join(process.env.USERPROFILE || process.env.HOME || os.homedir(), '.zoho-bug-track');
 var SETTINGS_FILE = path.join(SETTINGS_DIR, 'settings.json');
+
+/** Recursively create a directory path (Node 8 compatible). */
+function mkdirpSync(dirPath) {
+  var parts = path.resolve(dirPath).split(path.sep);
+  var current = '';
+  for (var i = 0; i < parts.length; i++) {
+    current = current ? path.join(current, parts[i]) : parts[i] + path.sep;
+    if (current === path.sep || current.match(/^[A-Z]:\\$/i)) continue;
+    try { fs.mkdirSync(current); } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+    }
+  }
+}
+
 try {
   if (!fs.existsSync(BUG_TRACKER_DATA_DIR)) {
     fs.mkdirSync(BUG_TRACKER_DATA_DIR);
   }
-  if (!fs.existsSync(PROMPTS_DIR)) {
-    fs.mkdirSync(PROMPTS_DIR);
-  }
+  mkdirpSync(PROMPTS_DIR);
+  console.log('[agent] Reproductions dir:', PROMPTS_DIR);
   if (!fs.existsSync(SETTINGS_DIR)) {
     fs.mkdirSync(SETTINGS_DIR);
     console.log('[agent] Created settings dir:', SETTINGS_DIR);

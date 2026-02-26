@@ -1516,7 +1516,11 @@ function handleRequest(req, res) {
             // ── Inject reproduction screenshot into vision images ──
             if (reproResult && reproResult.screenshotFile) {
               try {
-                var reproScreenshotPath = require('path').join(__dirname, 'data', 'agent-data', 'prompts', reproResult.screenshotFile);
+                // Screenshots are now in ~/Documents/.zoho-bug-track-logs/reproductions/
+                var _docsDir = require('os').homedir();
+                var _dPath = require('path').join(_docsDir, 'Documents');
+                if (!require('fs').existsSync(_dPath)) _dPath = _docsDir;
+                var reproScreenshotPath = require('path').join(_dPath, '.zoho-bug-track-logs', 'reproductions', reproResult.screenshotFile);
                 if (require('fs').existsSync(reproScreenshotPath)) {
                   var screenshotData = require('fs').readFileSync(reproScreenshotPath);
                   var screenshotBase64 = screenshotData.toString('base64');
