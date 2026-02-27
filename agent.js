@@ -956,6 +956,245 @@ function extractComponentRefs(hbsContent) {
   return Object.keys(components);
 }
 
+// ── Component Registry: extract rendering metadata from all component.js files ──
+
+/**
+ * Extract Ember rendering metadata from a component JS source.
+ * Returns { tagName, classNames, classNameBindings, attributeBindings, actions }
+ */
+function extractComponentMeta(jsContent) {
+  if (!jsContent) return {};
+  var meta = {};
+
+  // tagName: 'tr' or tagName: 'span'
+  var tagMatch = jsContent.match(/tagName\s*:\s*['"]([a-zA-Z0-9-]+)['"]/);
+  if (tagMatch) meta.tagName = tagMatch[1];
+
+  // classNames: ['my-class', 'another-class']
+  var cnMatch = jsContent.match(/classNames\s*:\s*\[([^\]]*)\]/);
+  if (cnMatch) {
+    meta.classNames = [];
+    var cnStr = cnMatch[1];
+    var cnRegex = /['"]([^'"]+)['"]/g;
+    var cnM;
+    while ((cnM = cnRegex.exec(cnStr)) !== null) {
+      meta.classNames.push(cnM[1]);
+    }
+  }
+
+  // classNameBindings: ['isActive:active', 'isHidden:hidden:visible']
+  var cbMatch = jsContent.match(/classNameBindings\s*:\s*\[([^\]]*)\]/);
+  if (cbMatch) {
+    meta.classNameBindings = [];
+    var cbStr = cbMatch[1];
+    var cbRegex = /['"]([^'"]+)['"]/g;
+    var cbM;
+    while ((cbM = cbRegex.exec(cbStr)) !== null) {
+      meta.classNameBindings.push(cbM[1]);
+    }
+  }
+
+  // attributeBindings: ['disabled', 'title', 'data-id:elementId']
+  var abMatch = jsContent.match(/attributeBindings\s*:\s*\[([^\]]*)\]/);
+  if (abMatch) {
+    meta.attributeBindings = [];
+    var abStr = abMatch[1];
+    var abRegex = /['"]([^'"]+)['"]/g;
+    var abM;
+    while ((abM = abRegex.exec(abStr)) !== null) {
+      meta.attributeBindings.push(abM[1]);
+    }
+  }
+
+  // actions: { delete: function() {}, save: function() {} }
+  var actionNames = [];
+  var actionsBlockMatch = jsContent.match(/actions\s*:\s*\{/);
+  if (actionsBlockMatch) {
+    // Extract action names from the actions hash
+    var actStart = actionsBlockMatch.index + actionsBlockMatch[0].length;
+    var depth = 1;
+    var actEnd = actStart;
+    for (var ai = actStart; ai < jsContent.length && depth > 0; ai++) {
+      if (jsContent[ai] === '{') depth++;
+      if (jsContent[ai] === '}') depth--;
+      actEnd = ai;
+    }
+    var actionsBlock = jsContent.substring(actStart, actEnd);
+    // Match: actionName: function or actionName() {
+    var actRegex = /([a-zA-Z_$][a-zA-Z0-9_$]*)\s*(?::\s*function|\()/g;
+    var actM;
+    while ((actM = actRegex.exec(actionsBlock)) !== null) {
+      var actName = actM[1];
+      // Skip common non-action keywords
+      if (['function', 'var', 'if', 'else', 'return', 'this', 'get', 'set', 'forEach', 'map', 'filter', 'then', 'catch'].indexOf(actName) === -1) {
+        actionNames.push(actName);
+      }
+    }
+  }
+  if (actionNames.length > 0) meta.actions = actionNames;
+
+  // layoutName or layout (rare but useful)
+  var layoutMatch = jsContent.match(/layoutName\s*:\s*['"]([^'"]+)['"]/);
+  if (layoutMatch) meta.layoutName = layoutMatch[1];
+
+  return meta;
+}
+
+/**
+ * Extract all data-auto-id values from HBS template content.
+ * Returns array of { id, tag, classes, text }
+ * Also extracts data-auto-id used inside Ember component invocations.
+ */
+function extractDataAutoIds(hbsContent) {
+  if (!hbsContent) return [];
+  var results = [];
+  var seen = {};
+
+  // Match data-auto-id="value" or data-auto-id='value'
+  var regex = /data-auto-id=["']([^"']+)["']/g;
+  var match;
+  while ((match = regex.exec(hbsContent)) !== null) {
+    var id = match[1];
+    if (seen[id]) continue;
+    seen[id] = true;
+
+    // Find enclosing tag for context
+    var before = hbsContent.substring(Math.max(0, match.index - 500), match.index);
+    var tagStart = before.lastIndexOf('<');
+    var curlyStart = before.lastIndexOf('{{');
+    var tag = 'div';
+    var classes = '';
+
+    if (curlyStart > tagStart && curlyStart >= 0) {
+      // Inside a component invocation like {{my-component data-auto-id="x"}}
+      var curlySnippet = before.substring(curlyStart);
+      var compMatch = curlySnippet.match(/^\{\{#?([a-z][a-z0-9-]*)/);
+      if (compMatch) tag = '{{' + compMatch[1] + '}}';
+      var clsMatch = curlySnippet.match(/class=["']([^"']+)["']/);
+      if (clsMatch) classes = clsMatch[1];
+    } else if (tagStart >= 0) {
+      // Inside a regular HTML element like <button data-auto-id="x">
+      var tagSnippet = before.substring(tagStart);
+      var tagNameMatch = tagSnippet.match(/^<([a-zA-Z][a-zA-Z0-9-]*)/);
+      if (tagNameMatch) tag = tagNameMatch[1].toLowerCase();
+      var classMatch = tagSnippet.match(/class=["']([^"']+)["']/);
+      if (classMatch) classes = classMatch[1];
+    }
+
+    // Get visible text after the element opening for context
+    var after = hbsContent.substring(match.index, Math.min(hbsContent.length, match.index + 300));
+    var textMatch = after.match(/>\s*([^<{][^<{]*)/);
+    var text = textMatch ? textMatch[1].trim().substring(0, 60) : '';
+
+    results.push({ id: id, tag: tag, classes: classes, text: text });
+  }
+  return results;
+}
+
+/**
+ * Build a registry of all components in the project with their rendering metadata.
+ * Scans pods/components/ and components/ directories.
+ * Returns array of { name, tagName, classNames, classNameBindings, actions, dataAutoIds, ... }
+ */
+function extractComponentRegistry() {
+  var registry = [];
+  var seen = {};
+
+  function scanDir(baseDir, prefix) {
+    if (!fs.existsSync(baseDir)) return;
+    var entries;
+    try { entries = fs.readdirSync(baseDir); } catch (e) { return; }
+
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i];
+      var entryPath = path.join(baseDir, entry);
+      var stat;
+      try { stat = fs.statSync(entryPath); } catch (e) { continue; }
+
+      if (stat.isDirectory()) {
+        // Check if this dir has component.js (pods component)
+        var compJsPath = path.join(entryPath, 'component.js');
+        var compHbsPath = path.join(entryPath, 'template.hbs');
+        var compName = prefix ? prefix + '/' + entry : entry;
+
+        if (fs.existsSync(compJsPath) || fs.existsSync(compHbsPath)) {
+          if (!seen[compName]) {
+            seen[compName] = true;
+            var meta = {};
+            if (fs.existsSync(compJsPath)) {
+              try {
+                var jsContent = fs.readFileSync(compJsPath, 'utf-8');
+                meta = extractComponentMeta(jsContent);
+              } catch (e) { /* skip */ }
+            }
+            meta.name = compName;
+            meta.hasTpl = fs.existsSync(compHbsPath);
+            meta.hasJs = fs.existsSync(compJsPath);
+            // Extract data-auto-id from HBS template
+            if (meta.hasTpl) {
+              try {
+                var hbsContent = fs.readFileSync(compHbsPath, 'utf-8');
+                var autoIds = extractDataAutoIds(hbsContent);
+                if (autoIds.length > 0) meta.dataAutoIds = autoIds;
+              } catch (e) { /* skip */ }
+            }
+            registry.push(meta);
+          }
+        }
+        // Recurse into subdirectories (nested components)
+        scanDir(entryPath, compName);
+      } else if (entry.endsWith('.js') && !prefix) {
+        // Classic layout: components/my-component.js
+        var clName = entry.replace(/\.js$/, '');
+        if (!seen[clName]) {
+          seen[clName] = true;
+          try {
+            var clJsContent = fs.readFileSync(entryPath, 'utf-8');
+            var clMeta = extractComponentMeta(clJsContent);
+            clMeta.name = clName;
+            clMeta.hasJs = true;
+            // Check if classic template exists
+            var clHbs = path.join(config.dir, 'templates', 'components', clName + '.hbs');
+            clMeta.hasTpl = fs.existsSync(clHbs);
+            // Extract data-auto-id from classic template
+            if (clMeta.hasTpl) {
+              try {
+                var clHbsContent = fs.readFileSync(clHbs, 'utf-8');
+                var clAutoIds = extractDataAutoIds(clHbsContent);
+                if (clAutoIds.length > 0) clMeta.dataAutoIds = clAutoIds;
+              } catch (e) { /* skip */ }
+            }
+            registry.push(clMeta);
+          } catch (e) { /* skip */ }
+        }
+      }
+    }
+  }
+
+  // Scan pods components
+  scanDir(path.join(config.dir, 'pods', 'components'), '');
+  // Scan classic components
+  scanDir(path.join(config.dir, 'components'), '');
+
+  console.log('[agent] 📦 Component registry:', registry.length, 'components scanned');
+  var withMeta = registry.filter(function (c) { return c.tagName || c.classNames || c.classNameBindings || c.actions; });
+  console.log('[agent]   With rendering metadata:', withMeta.length);
+
+  return registry;
+}
+
+// Cache component registry (rebuild every 10 minutes)
+var _componentRegistry = null;
+var _registryCacheTime = 0;
+function getCachedComponentRegistry() {
+  var now = Date.now();
+  if (!_componentRegistry || (now - _registryCacheTime) > 10 * 60 * 1000) {
+    _componentRegistry = extractComponentRegistry();
+    _registryCacheTime = now;
+  }
+  return _componentRegistry;
+}
+
 /**
  * Read a single component's template + JS from pods or classic layout.
  *
@@ -1014,6 +1253,12 @@ function readOneComponent(name) {
         result.jsContent = jsC;
       } catch (e) { /* skip */ }
     }
+  }
+
+  // Extract data-auto-ids from template content
+  if (result.content) {
+    var compAutoIds = extractDataAutoIds(result.content);
+    if (compAutoIds.length > 0) result.dataAutoIds = compAutoIds;
   }
 
   return result.content ? result : null;
@@ -1375,6 +1620,24 @@ function getTemplateContext(routePath) {
     console.log('[agent]     Main template helpers:', mainHelpers.map(function (h) { return h.path; }).join(', '));
   }
 
+  // Extract data-auto-ids from the route template and all component templates
+  var allDataAutoIds = [];
+  if (template) {
+    var routeAutoIds = extractDataAutoIds(template.content);
+    if (routeAutoIds.length > 0) {
+      allDataAutoIds = allDataAutoIds.concat(routeAutoIds);
+      console.log('[agent]   data-auto-id in route template:', routeAutoIds.length, routeAutoIds.map(function (a) { return a.id; }).join(', '));
+    }
+  }
+  componentTemplates.forEach(function (ct) {
+    if (ct.dataAutoIds && ct.dataAutoIds.length > 0) {
+      allDataAutoIds = allDataAutoIds.concat(ct.dataAutoIds);
+    }
+  });
+  if (allDataAutoIds.length > 0) {
+    console.log('[agent]   Total data-auto-id found:', allDataAutoIds.length);
+  }
+
   return {
     route: route,
     template: template,
@@ -1382,7 +1645,8 @@ function getTemplateContext(routePath) {
     routeJS: routeJS,
     dependencies: jsDeps,
     totalTemplates: (template ? 1 : 0) + componentTemplates.length,
-    hasTemplate: !!template
+    hasTemplate: !!template,
+    dataAutoIds: allDataAutoIds
   };
 }
 
@@ -1427,8 +1691,189 @@ function generateReproScript(bugId, bugTitle, bugDescription, devServerUrl, test
   L.push('var TARGET_ROUTE = ' + JSON.stringify(targetRoute || '') + ';  // Route to navigate after login');
   L.push('var SCREENSHOT = ' + JSON.stringify(screenshotPath) + ';');
   L.push('');
+  // ═══════════════════════════════════════════════════════════════
+  //  SELF-HEALING HELPERS — injected into every generated script
+  // ═══════════════════════════════════════════════════════════════
+  L.push('// ── Self-Healing Puppeteer Helpers ──');
+  L.push('var stepResults = [];');
+  L.push('');
+
+  // Helper: waitForAny — polls for any of the given selectors
+  L.push('function waitForAny(page, selectors, timeout) {');
+  L.push('  timeout = timeout || 10000;');
+  L.push('  var deadline = Date.now() + timeout;');
+  L.push('  function poll() {');
+  L.push('    function tryIdx(i) {');
+  L.push('      if (i >= selectors.length) return Promise.resolve(null);');
+  L.push('      return page.$(selectors[i]).then(function (el) {');
+  L.push('        if (el) return { el: el, selector: selectors[i], index: i };');
+  L.push('        return tryIdx(i + 1);');
+  L.push('      }).catch(function () { return tryIdx(i + 1); });');
+  L.push('    }');
+  L.push('    return tryIdx(0).then(function (found) {');
+  L.push('      if (found) return found;');
+  L.push('      if (Date.now() > deadline) return null;');
+  L.push('      return new Promise(function (r) { setTimeout(r, 400); }).then(poll);');
+  L.push('    });');
+  L.push('  }');
+  L.push('  return poll();');
+  L.push('}');
+  L.push('');
+
+  // Helper: findByText — searches the live DOM for an element by visible text
+  L.push('function findByText(page, textHint, tagFilter) {');
+  L.push('  return page.evaluate(function (searchText, tags) {');
+  L.push('    var candidateSel = tags || "button, a, [role=button], input[type=submit], input[type=button], label, span, div, li, td, th, h1, h2, h3, h4";');
+  L.push('    var candidates = document.querySelectorAll(candidateSel);');
+  L.push('    var best = null; var bestLen = 999999;');
+  L.push('    for (var i = 0; i < candidates.length; i++) {');
+  L.push('      var el = candidates[i]; var rect = el.getBoundingClientRect();');
+  L.push('      if (rect.width === 0 || rect.height === 0) continue;');
+  L.push('      var t = (el.textContent || "").trim();');
+  L.push('      if (t.toLowerCase().indexOf(searchText.toLowerCase()) !== -1 && t.length < bestLen) {');
+  L.push('        best = i; bestLen = t.length;');
+  L.push('      }');
+  L.push('    }');
+  L.push('    if (best === null) return null;');
+  L.push('    var chosen = candidates[best];');
+  L.push('    // Build a usable CSS selector');
+  L.push('    if (chosen.id && !/^ember/.test(chosen.id)) return "#" + chosen.id;');
+  L.push('    var cls = (chosen.className || "").trim().split(/\\s+/).filter(function (c) { return c && !/^ember/.test(c); });');
+  L.push('    if (cls.length > 0) {');
+  L.push('      var sel = chosen.tagName.toLowerCase() + "." + cls.join(".");');
+  L.push('      if (document.querySelectorAll(sel).length <= 3) return sel;');
+  L.push('    }');
+  L.push('    return "__TEXT_IDX__" + best;');
+  L.push('  }, textHint, tagFilter).then(function (sel) {');
+  L.push('    if (!sel) return null;');
+  L.push('    if (sel.indexOf("__TEXT_IDX__") === 0) {');
+  L.push('      var idx = parseInt(sel.replace("__TEXT_IDX__", ""), 10);');
+  L.push('      var tags2 = tagFilter || "button, a, [role=button], input[type=submit], input[type=button], label, span, div, li, td, th, h1, h2, h3, h4";');
+  L.push('      return page.$$(tags2).then(function (els) {');
+  L.push('        if (els[idx]) return { el: els[idx], selector: "(text:\\"" + textHint + "\\")", method: "text-search" };');
+  L.push('        return null;');
+  L.push('      });');
+  L.push('    }');
+  L.push('    return page.$(sel).then(function (el) {');
+  L.push('      if (el) return { el: el, selector: sel, method: "text-search" };');
+  L.push('      return null;');
+  L.push('    });');
+  L.push('  }).catch(function () { return null; });');
+  L.push('}');
+  L.push('');
+
+  // Helper: findElement — master finder with data-auto-id priority + CSS selectors + text fallback
+  L.push('function findElement(page, primary, fallbacks, textHint, timeout) {');
+  L.push('  // Prioritize data-auto-id selectors — move them to the front of the list');
+  L.push('  var allSels = [primary].concat(fallbacks || []).filter(Boolean);');
+  L.push('  var autoIdSels = [];');
+  L.push('  var otherSels = [];');
+  L.push('  for (var si = 0; si < allSels.length; si++) {');
+  L.push('    if (allSels[si].indexOf("data-auto-id") !== -1) autoIdSels.push(allSels[si]);');
+  L.push('    else otherSels.push(allSels[si]);');
+  L.push('  }');
+  L.push('  var orderedSels = autoIdSels.concat(otherSels);');
+  L.push('  return waitForAny(page, orderedSels, timeout || 10000).then(function (found) {');
+  L.push('    if (found) {');
+  L.push('      var method = found.selector === primary ? "primary" : (found.selector.indexOf("data-auto-id") !== -1 ? "data-auto-id" : "fallback");');
+  L.push('      return { el: found.el, selector: found.selector, method: method };');
+  L.push('    }');
+  L.push('    // CSS selectors all failed — try text search');
+  L.push('    if (textHint) return findByText(page, textHint);');
+  L.push('    return null;');
+  L.push('  });');
+  L.push('}');
+  L.push('');
+
+  // Helper: emberSettle — waits for Ember run loop + jQuery AJAX to complete
+  L.push('function emberSettle(page) {');
+  L.push('  return page.evaluate(function () {');
+  L.push('    return new Promise(function (resolve) {');
+  L.push('      var checks = 0;');
+  L.push('      function check() {');
+  L.push('        checks++;');
+  L.push('        if (checks > 60) { resolve(); return; }'); // 3s max
+  L.push('        var pending = false;');
+  L.push('        try {');
+  L.push('          if (window.jQuery && window.jQuery.active > 0) pending = true;');
+  L.push('          if (window.Ember && window.Ember.run && window.Ember.run.backburner) {');
+  L.push('            var bb = window.Ember.run.backburner;');
+  L.push('            if (bb.currentInstance) pending = true;');
+  L.push('            if (bb._timers && bb._timers.length > 0) pending = true;');
+  L.push('          }');
+  L.push('        } catch(e) {}');
+  L.push('        if (pending) { setTimeout(check, 50); }');
+  L.push('        else { setTimeout(resolve, 150); }');
+  L.push('      }');
+  L.push('      setTimeout(check, 50);');
+  L.push('    });');
+  L.push('  }).catch(function () {');
+  L.push('    return new Promise(function (r) { setTimeout(r, 400); });');
+  L.push('  });');
+  L.push('}');
+  L.push('');
+
+  // Helper: scrollIntoView
+  L.push('function scrollTo(page, selector) {');
+  L.push('  return page.evaluate(function (sel) {');
+  L.push('    var el = document.querySelector(sel);');
+  L.push('    if (el) el.scrollIntoView({ behavior: "instant", block: "center" });');
+  L.push('  }, selector).catch(function () {});');
+  L.push('}');
+  L.push('');
+
+  // Helper: DOM pre-scan — capture all interactive elements for diagnostics (includes data-auto-id)
+  L.push('function domPreScan(page) {');
+  L.push('  return page.evaluate(function () {');
+  L.push('    var info = { buttons: [], inputs: [], links: [], selects: [], allClasses: [], dataAutoIds: [] };');
+  L.push('    function describe(el) {');
+  L.push('      var rect = el.getBoundingClientRect();');
+  L.push('      if (rect.width === 0 && rect.height === 0) return null;');
+  L.push('      var cls = (el.className && typeof el.className === "string") ? el.className.trim() : "";');
+  L.push('      return { tag: el.tagName.toLowerCase(), id: el.id || null, class: cls,');
+  L.push('        text: (el.textContent || "").trim().substring(0, 80),');
+  L.push('        type: el.type || null, name: el.name || null, placeholder: el.placeholder || null,');
+  L.push('        autoId: el.getAttribute("data-auto-id") || null };');
+  L.push('    }');
+  L.push('    document.querySelectorAll("button, [role=button], input[type=submit], input[type=button]").forEach(function (el) {');
+  L.push('      var d = describe(el); if (d) info.buttons.push(d);');
+  L.push('    });');
+  L.push('    document.querySelectorAll("input:not([type=hidden]), textarea").forEach(function (el) {');
+  L.push('      var d = describe(el); if (d) info.inputs.push(d);');
+  L.push('    });');
+  L.push('    document.querySelectorAll("a[href]").forEach(function (el) {');
+  L.push('      var d = describe(el); if (d) info.links.push(d);');
+  L.push('    });');
+  L.push('    document.querySelectorAll("select").forEach(function (el) {');
+  L.push('      var d = describe(el);');
+  L.push('      if (d) { d.options = Array.from(el.options).slice(0, 10).map(function (o) { return o.value + ":" + o.text; }); info.selects.push(d); }');
+  L.push('    });');
+  L.push('    // Collect ALL elements with data-auto-id');
+  L.push('    document.querySelectorAll("[data-auto-id]").forEach(function (el) {');
+  L.push('      var rect = el.getBoundingClientRect();');
+  L.push('      if (rect.width === 0 && rect.height === 0) return;');
+  L.push('      var cls = (el.className && typeof el.className === "string") ? el.className.trim() : "";');
+  L.push('      info.dataAutoIds.push({');
+  L.push('        autoId: el.getAttribute("data-auto-id"),');
+  L.push('        tag: el.tagName.toLowerCase(),');
+  L.push('        class: cls,');
+  L.push('        text: (el.textContent || "").trim().substring(0, 60),');
+  L.push('        selector: "[data-auto-id=\\"" + el.getAttribute("data-auto-id") + "\\"]"');
+  L.push('      });');
+  L.push('    });');
+  L.push('    // Collect all unique CSS classes on the page');
+  L.push('    var classSet = {};');
+  L.push('    document.querySelectorAll("[class]").forEach(function (el) {');
+  L.push('      if (typeof el.className === "string") el.className.trim().split(/\\s+/).forEach(function (c) { if (c && !/^ember/.test(c)) classSet[c] = true; });');
+  L.push('    });');
+  L.push('    info.allClasses = Object.keys(classSet).sort();');
+  L.push('    return info;');
+  L.push('  }).catch(function () { return { buttons: [], inputs: [], links: [], selects: [], allClasses: [], dataAutoIds: [] }; });');
+  L.push('}');
+  L.push('');
+
   L.push('function run() {');
-  L.push('  var result = { passed: false, errors: [], assertions: [], title: "", pageUrl: "", navigationOk: false };');
+  L.push('  var result = { passed: false, errors: [], assertions: [], title: "", pageUrl: "", navigationOk: false, stepResults: [], domSnapshot: null };');
   L.push('  var browser;');
   L.push('');
   L.push('  return puppeteer.launch({');
@@ -1631,110 +2076,245 @@ function generateReproScript(bugId, bugTitle, bugDescription, devServerUrl, test
   L.push('    })');
   L.push('    .then(function () {');
 
-  // ── Layer 2: AI-generated interaction steps ──
+  // ── Layer 2: AI-generated interaction steps (SELF-HEALING ENGINE) ──
   if (interactionSteps && interactionSteps.length > 0) {
-    L.push('      // ── Step 3: AI-generated interaction steps (' + interactionSteps.length + ' steps) ──');
-    L.push('      console.log("Executing " + ' + JSON.stringify(String(interactionSteps.length)) + ' + " AI-generated interaction steps...");');
+    L.push('      // ── Step 3: AI-generated interaction steps (' + interactionSteps.length + ' steps) — SELF-HEALING ──');
+    L.push('      console.log("\\n═══ Executing " + ' + JSON.stringify(String(interactionSteps.length)) + ' + " interaction steps (self-healing mode) ═══");');
     L.push('      var interactionErrors = [];');
-    L.push('      return Promise.resolve()');
+    L.push('');
+    // DOM Pre-scan: capture page state before interacting
+    L.push('      // DOM Pre-Scan: discover what is actually on the page');
+    L.push('      return domPreScan(page).then(function (snapshot) {');
+    L.push('        result.domSnapshot = snapshot;');
+    L.push('        console.log("  📋 DOM Pre-Scan: " + snapshot.buttons.length + " buttons, " + snapshot.inputs.length + " inputs, " + snapshot.links.length + " links, " + snapshot.selects.length + " selects, " + (snapshot.dataAutoIds || []).length + " data-auto-ids");');
+    L.push('        if (snapshot.buttons.length > 0) console.log("     Buttons: " + snapshot.buttons.map(function (b) { return (b.autoId || b.text || b.class || b.id || "?").substring(0, 30); }).join(", "));');
+    L.push('        if (snapshot.inputs.length > 0) console.log("     Inputs: " + snapshot.inputs.map(function (i) { return (i.autoId || i.placeholder || i.name || i.class || i.type || "?").substring(0, 30); }).join(", "));');
+    L.push('        if ((snapshot.dataAutoIds || []).length > 0) console.log("     data-auto-ids: " + snapshot.dataAutoIds.map(function (d) { return d.autoId; }).join(", "));');
+    L.push('      })');
+    L.push('      .then(function () { return Promise.resolve(); })');
+
     for (var si = 0; si < interactionSteps.length; si++) {
       var step = interactionSteps[si];
       var stepNum = si + 1;
       var desc = (step.description || step.action || 'step').replace(/'/g, "\\'").replace(/"/g, '\\"');
+      var primarySel = JSON.stringify(step.selector || 'body');
+      var fallbacksJSON = JSON.stringify(step.fallbackSelectors || []);
+      var textHint = JSON.stringify(step.textContent || '');
+      var hasFallbacks = (step.fallbackSelectors && step.fallbackSelectors.length > 0);
+      var hasTextHint = !!step.textContent;
+
       L.push('      .then(function () {');
-      L.push('        console.log("  Step ' + stepNum + '/' + interactionSteps.length + ': ' + desc + '");');
+      L.push('        console.log("\\n  Step ' + stepNum + '/' + interactionSteps.length + ': [' + (step.action || '?') + '] ' + desc + '");');
 
       if (step.action === 'click') {
-        L.push('        return page.click(' + JSON.stringify(step.selector || 'body') + ').catch(function (e) {');
-        L.push('          console.log("    ⚠ Click failed: " + e.message);');
-        L.push('          interactionErrors.push("Step ' + stepNum + ' click failed: " + e.message);');
+        // SELF-HEALING CLICK: find element → scroll → click → settle
+        L.push('        return findElement(page, ' + primarySel + ', ' + fallbacksJSON + ', ' + textHint + ', 12000)');
+        L.push('        .then(function (found) {');
+        L.push('          if (!found) {');
+        L.push('            console.log("    ❌ Element NOT FOUND: " + ' + primarySel + ');');
+        L.push('            interactionErrors.push("Step ' + stepNum + ': element not found — " + ' + primarySel + ');');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "click", status: "not-found", selector: ' + primarySel + ' });');
+        L.push('            return page.screenshot({ path: SCREENSHOT.replace(".png", "_step' + stepNum + '_fail.png") }).catch(function () {});');
+        L.push('          }');
+        L.push('          if (found.method !== "primary") console.log("    🔄 Self-healed: " + found.selector + " (via " + found.method + ")");');
+        L.push('          return scrollTo(page, found.selector !== "(text:\\"" + ' + textHint + ' + "\\")" ? found.selector : "body")');
+        L.push('          .then(function () { return new Promise(function (r) { setTimeout(r, 150); }); })');
+        L.push('          .then(function () { return found.el.click(); })');
+        L.push('          .then(function () {');
+        L.push('            console.log("    ✅ Clicked: " + found.selector);');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "click", status: "ok", usedSelector: found.selector, method: found.method });');
+        L.push('          });');
+        L.push('        })');
+        L.push('        .catch(function (e) {');
+        L.push('          console.log("    ⚠ Click error: " + e.message);');
+        L.push('          interactionErrors.push("Step ' + stepNum + ' click error: " + e.message);');
+        L.push('          stepResults.push({ step: ' + stepNum + ', action: "click", status: "error", error: e.message });');
+        L.push('          return page.screenshot({ path: SCREENSHOT.replace(".png", "_step' + stepNum + '_err.png") }).catch(function () {});');
         L.push('        });');
+
       } else if (step.action === 'type') {
-        L.push('        return page.click(' + JSON.stringify(step.selector || 'body') + ').then(function () {');
-        L.push('          return page.type(' + JSON.stringify(step.selector || 'body') + ', ' + JSON.stringify(step.text || '') + ');');
-        L.push('        }).catch(function (e) {');
-        L.push('          console.log("    ⚠ Type failed: " + e.message);');
-        L.push('          interactionErrors.push("Step ' + stepNum + ' type failed: " + e.message);');
+        // SELF-HEALING TYPE: find → click to focus → clear → type → dispatch events → settle
+        var typeText = JSON.stringify(step.text || step.value || '');
+        L.push('        return findElement(page, ' + primarySel + ', ' + fallbacksJSON + ', ' + textHint + ', 12000)');
+        L.push('        .then(function (found) {');
+        L.push('          if (!found) {');
+        L.push('            console.log("    ❌ Input NOT FOUND: " + ' + primarySel + ');');
+        L.push('            interactionErrors.push("Step ' + stepNum + ': input not found — " + ' + primarySel + ');');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "type", status: "not-found", selector: ' + primarySel + ' });');
+        L.push('            return page.screenshot({ path: SCREENSHOT.replace(".png", "_step' + stepNum + '_fail.png") }).catch(function () {});');
+        L.push('          }');
+        L.push('          if (found.method !== "primary") console.log("    🔄 Self-healed: " + found.selector + " (via " + found.method + ")");');
+        L.push('          var usedSel = found.selector;');
+        L.push('          // Click to focus, then clear existing content');
+        L.push('          return found.el.click()');
+        L.push('          .then(function () {');
+        L.push('            // Triple-click to select all, then clear');
+        L.push('            return page.evaluate(function (sel) {');
+        L.push('              var el = document.querySelector(sel);');
+        L.push('              if (el) { el.focus(); el.value = ""; }');
+        L.push('            }, usedSel).catch(function () {});');
+        L.push('          })');
+        L.push('          .then(function () { return page.click(usedSel, { clickCount: 3 }).catch(function () {}); })');
+        L.push('          .then(function () { return page.keyboard.press("Backspace").catch(function () {}); })');
+        L.push('          .then(function () {');
+        L.push('            return page.type(usedSel, ' + typeText + ', { delay: 20 });');
+        L.push('          })');
+        L.push('          .then(function () {');
+        L.push('            // Dispatch input + change events for Ember bindings');
+        L.push('            return page.evaluate(function (sel) {');
+        L.push('              var el = document.querySelector(sel);');
+        L.push('              if (el) {');
+        L.push('                el.dispatchEvent(new Event("input", { bubbles: true }));');
+        L.push('                el.dispatchEvent(new Event("change", { bubbles: true }));');
+        L.push('                el.dispatchEvent(new Event("blur", { bubbles: true }));');
+        L.push('              }');
+        L.push('            }, usedSel);');
+        L.push('          })');
+        L.push('          .then(function () {');
+        L.push('            console.log("    ✅ Typed into: " + usedSel + " → " + ' + typeText + ');');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "type", status: "ok", usedSelector: usedSel, method: found.method });');
+        L.push('          });');
+        L.push('        })');
+        L.push('        .catch(function (e) {');
+        L.push('          console.log("    ⚠ Type error: " + e.message);');
+        L.push('          interactionErrors.push("Step ' + stepNum + ' type error: " + e.message);');
+        L.push('          stepResults.push({ step: ' + stepNum + ', action: "type", status: "error", error: e.message });');
+        L.push('          return page.screenshot({ path: SCREENSHOT.replace(".png", "_step' + stepNum + '_err.png") }).catch(function () {});');
         L.push('        });');
+
       } else if (step.action === 'waitForSelector') {
-        L.push('        return page.waitForSelector(' + JSON.stringify(step.selector || 'body') + ', { timeout: ' + (step.timeout || 10000) + ' }).catch(function (e) {');
-        L.push('          console.log("    ⚠ Wait failed: " + e.message);');
-        L.push('          interactionErrors.push("Step ' + stepNum + ' wait failed: " + e.message);');
+        // Enhanced wait with fallback selectors
+        L.push('        return findElement(page, ' + primarySel + ', ' + fallbacksJSON + ', ' + textHint + ', ' + (step.timeout || 15000) + ')');
+        L.push('        .then(function (found) {');
+        L.push('          if (!found) {');
+        L.push('            console.log("    ❌ Wait target NOT FOUND: " + ' + primarySel + ');');
+        L.push('            interactionErrors.push("Step ' + stepNum + ': wait target not found");');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "wait", status: "not-found", selector: ' + primarySel + ' });');
+        L.push('          } else {');
+        L.push('            console.log("    ✅ Found: " + found.selector + " (via " + found.method + ")");');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "wait", status: "ok", usedSelector: found.selector, method: found.method });');
+        L.push('          }');
         L.push('        });');
+
       } else if (step.action === 'select') {
-        L.push('        return page.select(' + JSON.stringify(step.selector || 'select') + ', ' + JSON.stringify(step.value || '') + ').catch(function (e) {');
-        L.push('          console.log("    ⚠ Select failed: " + e.message);');
-        L.push('          interactionErrors.push("Step ' + stepNum + ' select failed: " + e.message);');
+        // SELF-HEALING SELECT: find dropdown → select value → dispatch events
+        L.push('        return findElement(page, ' + primarySel + ', ' + fallbacksJSON + ', ' + textHint + ', 12000)');
+        L.push('        .then(function (found) {');
+        L.push('          if (!found) {');
+        L.push('            console.log("    ❌ Select NOT FOUND: " + ' + primarySel + ');');
+        L.push('            interactionErrors.push("Step ' + stepNum + ': select not found");');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "select", status: "not-found", selector: ' + primarySel + ' });');
+        L.push('            return;');
+        L.push('          }');
+        L.push('          return page.select(found.selector, ' + JSON.stringify(step.value || '') + ')');
+        L.push('          .then(function () {');
+        L.push('            return page.evaluate(function (sel) {');
+        L.push('              var el = document.querySelector(sel);');
+        L.push('              if (el) { el.dispatchEvent(new Event("change", { bubbles: true })); }');
+        L.push('            }, found.selector);');
+        L.push('          })');
+        L.push('          .then(function () {');
+        L.push('            console.log("    ✅ Selected: " + found.selector + " → ' + (step.value || '').replace(/'/g, "\\'") + '");');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "select", status: "ok", usedSelector: found.selector });');
+        L.push('          });');
+        L.push('        })');
+        L.push('        .catch(function (e) {');
+        L.push('          console.log("    ⚠ Select error: " + e.message);');
+        L.push('          interactionErrors.push("Step ' + stepNum + ' select error: " + e.message);');
+        L.push('          stepResults.push({ step: ' + stepNum + ', action: "select", status: "error", error: e.message });');
         L.push('        });');
+
       } else if (step.action === 'wait') {
-        L.push('        return new Promise(function (r) { setTimeout(r, ' + (step.ms || 1000) + '); });');
+        L.push('        var _waitMs = ' + (step.ms || 1000) + ';');
+        L.push('        console.log("    ⏳ Waiting " + _waitMs + "ms...");');
+        L.push('        stepResults.push({ step: ' + stepNum + ', action: "wait", status: "ok", ms: _waitMs });');
+        L.push('        return new Promise(function (r) { setTimeout(r, _waitMs); });');
+
       } else if (step.action === 'screenshot') {
         var ssName = (step.name || 'step_' + stepNum).replace(/[^a-zA-Z0-9_-]/g, '_');
+        L.push('        stepResults.push({ step: ' + stepNum + ', action: "screenshot", status: "ok" });');
         L.push('        return page.screenshot({ path: SCREENSHOT.replace(".png", "_' + ssName + '.png") }).catch(function () {});');
+
       } else if (step.action === 'hover') {
-        L.push('        return page.hover(' + JSON.stringify(step.selector || 'body') + ').catch(function (e) {');
-        L.push('          console.log("    ⚠ Hover failed: " + e.message);');
-        L.push('          interactionErrors.push("Step ' + stepNum + ' hover failed: " + e.message);');
+        L.push('        return findElement(page, ' + primarySel + ', ' + fallbacksJSON + ', ' + textHint + ', 10000)');
+        L.push('        .then(function (found) {');
+        L.push('          if (!found) {');
+        L.push('            console.log("    ❌ Hover target NOT FOUND: " + ' + primarySel + ');');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "hover", status: "not-found" });');
+        L.push('            return;');
+        L.push('          }');
+        L.push('          return page.hover(found.selector).then(function () {');
+        L.push('            console.log("    ✅ Hovered: " + found.selector);');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "hover", status: "ok", usedSelector: found.selector });');
+        L.push('          });');
+        L.push('        })');
+        L.push('        .catch(function (e) {');
+        L.push('          console.log("    ⚠ Hover error: " + e.message);');
+        L.push('          stepResults.push({ step: ' + stepNum + ', action: "hover", status: "error", error: e.message });');
         L.push('        });');
+
       } else if (step.action === 'assert') {
-        // Assertion step — checks element attribute/text against expected value
-        var assertSel = JSON.stringify(step.selector || 'body');
+        // ENHANCED ASSERTION: find element via self-healing, then check
         var assertAttr = step.attribute || 'textContent';
         var assertExpected = step.expected || '';
         var assertCompare = step.compare || 'equals';
-        L.push('        return page.$(' + assertSel + ').then(function (el) {');
-        L.push('          if (!el) {');
-        L.push('            console.log("    ⚠ Assert element not found: ' + (step.selector || 'body').replace(/"/g, '\\"') + '");');
-        L.push('            result.assertions.push({ step: ' + stepNum + ', status: "element-not-found", selector: ' + assertSel + ' });');
-        L.push('            return;');
+        L.push('        return findElement(page, ' + primarySel + ', ' + fallbacksJSON + ', ' + textHint + ', 10000)');
+        L.push('        .then(function (found) {');
+        L.push('          if (!found) {');
+        L.push('            console.log("    ⚠ Assert target NOT FOUND: " + ' + primarySel + ');');
+        L.push('            result.assertions.push({ step: ' + stepNum + ', status: "element-not-found", selector: ' + primarySel + ' });');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "assert", status: "not-found" });');
+        L.push('            return page.screenshot({ path: SCREENSHOT.replace(".png", "_step' + stepNum + '_assert_fail.png") }).catch(function () {});');
         L.push('          }');
+        L.push('          if (found.method !== "primary") console.log("    🔄 Self-healed assert target: " + found.selector);');
         if (assertAttr === 'textContent' || assertAttr === 'innerText') {
-          L.push('          return page.evaluate(function (el) { return (el.' + assertAttr + ' || "").trim(); }, el).then(function (actual) {');
+          L.push('          return page.evaluate(function (sel) { var el = document.querySelector(sel); return el ? (el.' + assertAttr + ' || "").trim() : ""; }, found.selector).then(function (actual) {');
         } else {
-          L.push('          return page.evaluate(function (el, attr) { return (el.getAttribute(attr) || "").trim(); }, el, ' + JSON.stringify(assertAttr) + ').then(function (actual) {');
+          L.push('          return page.evaluate(function (sel, attr) { var el = document.querySelector(sel); return el ? (el.getAttribute(attr) || "").trim() : ""; }, found.selector, ' + JSON.stringify(assertAttr) + ').then(function (actual) {');
         }
-        L.push('            console.log("    Assert: ' + assertAttr + ' = \'" + actual + "\'");');
+        L.push('            console.log("    Assert: ' + assertAttr + ' = \\"" + actual + "\\"");');
         if (assertCompare === 'contains') {
           L.push('            var matched = actual.toLowerCase().indexOf(' + JSON.stringify(assertExpected.toLowerCase()) + ') !== -1;');
         } else {
           L.push('            var matched = actual.toLowerCase() === ' + JSON.stringify(assertExpected.toLowerCase()) + ';');
         }
         L.push('            result.assertions.push({');
-        L.push('              step: ' + stepNum + ',');
-        L.push('              attribute: ' + JSON.stringify(assertAttr) + ',');
-        L.push('              expected: ' + JSON.stringify(assertExpected) + ',');
-        L.push('              actual: actual,');
-        L.push('              matched: matched,');
+        L.push('              step: ' + stepNum + ', attribute: ' + JSON.stringify(assertAttr) + ',');
+        L.push('              expected: ' + JSON.stringify(assertExpected) + ', actual: actual,');
+        L.push('              matched: matched, usedSelector: found.selector,');
         L.push('              description: ' + JSON.stringify(desc) + '');
         L.push('            });');
-        L.push('            if (matched) {');
-        L.push('              console.log("    ✅ ASSERT MATCHED — bug condition confirmed");');
-        L.push('            } else {');
-        L.push('              console.log("    ❌ ASSERT DID NOT MATCH — expected ' + assertExpected.replace(/'/g, '\\\'') + ' but got " + actual);');
-        L.push('            }');
+        L.push('            stepResults.push({ step: ' + stepNum + ', action: "assert", status: matched ? "matched" : "not-matched", expected: ' + JSON.stringify(assertExpected) + ', actual: actual });');
+        L.push('            if (matched) { console.log("    ✅ ASSERT MATCHED — bug condition confirmed"); }');
+        L.push('            else { console.log("    ❌ ASSERT DID NOT MATCH — expected ' + assertExpected.replace(/'/g, '\\\'').replace(/"/g, '\\"') + ' but got \\"" + actual + "\\""); }');
         L.push('          });');
-        L.push('        }).catch(function (e) {');
-        L.push('          console.log("    ⚠ Assert failed: " + e.message);');
-        L.push('          interactionErrors.push("Step ' + stepNum + ' assert failed: " + e.message);');
+        L.push('        })');
+        L.push('        .catch(function (e) {');
+        L.push('          console.log("    ⚠ Assert error: " + e.message);');
+        L.push('          interactionErrors.push("Step ' + stepNum + ' assert error: " + e.message);');
+        L.push('          stepResults.push({ step: ' + stepNum + ', action: "assert", status: "error", error: e.message });');
         L.push('        });');
+
       } else {
         L.push('        console.log("    Unknown action: ' + (step.action || 'none') + '");');
+        L.push('        stepResults.push({ step: ' + stepNum + ', action: "unknown", status: "skipped" });');
         L.push('        return Promise.resolve();');
       }
 
       L.push('      })');
-      // Small delay between steps for page to react
-      if (si < interactionSteps.length - 1) {
-        L.push('      .then(function () { return new Promise(function (r) { setTimeout(r, ' + (step.delayAfter || 500) + '); }); })');
-      }
+      // EMBER SETTLE after each step instead of fixed timeout
+      L.push('      .then(function () { return emberSettle(page); })');
     }
     L.push('      .then(function () {');
-    L.push('        console.log("Interaction steps complete. Errors: " + interactionErrors.length);');
+    L.push('        result.stepResults = stepResults;');
+    L.push('        var okCount = stepResults.filter(function (s) { return s.status === "ok" || s.status === "matched"; }).length;');
+    L.push('        var failCount = stepResults.filter(function (s) { return s.status === "not-found" || s.status === "error"; }).length;');
+    L.push('        console.log("\\n═══ Steps complete: " + okCount + "/" + ' + JSON.stringify(String(interactionSteps.length)) + ' + " OK, " + failCount + " failed ═══");');
     L.push('        if (interactionErrors.length > 0) {');
     L.push('          interactionErrors.forEach(function (e) { result.errors.push(e); });');
     L.push('        }');
-    L.push('        // Wait for any async UI updates after interactions');
-    L.push('        return new Promise(function (r) { setTimeout(r, 2000); });');
+    L.push('        // Final Ember settle + extra wait');
+    L.push('        return emberSettle(page).then(function () { return new Promise(function (r) { setTimeout(r, 1000); }); });');
     L.push('      });');
     L.push('    })');
     L.push('    .then(function () {');
@@ -1842,6 +2422,8 @@ function runReproScript(testFileName, callback) {
       var bugConfirmed = false;
       var assertions = [];
       var navigationOk = true;
+      var stepResults = [];
+      var domSnapshot = null;
       if (resultMatch) {
         try {
           var parsed = JSON.parse(resultMatch[1]);
@@ -1849,6 +2431,8 @@ function runReproScript(testFileName, callback) {
           bugConfirmed = !!parsed.bugConfirmed;
           assertions = parsed.assertions || [];
           navigationOk = parsed.navigationOk !== false;
+          stepResults = parsed.stepResults || [];
+          domSnapshot = parsed.domSnapshot || null;
           if (parsed.errors && parsed.errors.length) {
             fullOutput += '\nPage errors: ' + parsed.errors.join('; ');
           }
@@ -1865,8 +2449,10 @@ function runReproScript(testFileName, callback) {
         bugConfirmed: bugConfirmed,
         assertions: assertions,
         navigationOk: navigationOk,
+        stepResults: stepResults,
+        domSnapshot: domSnapshot,
         pageUrl: parsed ? parsed.pageUrl : null,
-        output: fullOutput.substring(0, 5000),
+        output: fullOutput.substring(0, 8000),
         duration: duration,
         screenshotFile: hasScreenshot ? path.basename(screenshotFile) : null,
         exitCode: err ? err.code : 0
@@ -2062,6 +2648,14 @@ function handleRequest(req, res) {
     console.log('[agent] GET /template-context route=' + routeParam);
     var templateCtx = getTemplateContext(routeParam);
     sendJSON(res, 200, templateCtx);
+    return;
+  }
+
+  // GET /component-registry — Layer 2: component rendering metadata
+  if (pathname === '/component-registry') {
+    console.log('[agent] GET /component-registry');
+    var registry = getCachedComponentRegistry();
+    sendJSON(res, 200, { components: registry, total: registry.length });
     return;
   }
 

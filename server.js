@@ -42,6 +42,92 @@ var logger = require('./lib/logger');
 var PORT = envConfig.PORT;
 var PUBLIC_DIR = path.join(__dirname, 'public');
 
+// ── In-memory analysis cache (bugId → analysis state) ────
+// Stores the result of /analyze so /fix can pick it up with user instructions.
+// Entries expire after 30 minutes.
+var _analysisCache = {};
+var ANALYSIS_CACHE_TTL = 30 * 60 * 1000; // 30 min
+
+function cacheAnalysis(bugId, userId, data) {
+  _analysisCache[bugId + ':' + userId] = {
+    data: data,
+    createdAt: Date.now()
+  };
+  // Prune old entries
+  var keys = Object.keys(_analysisCache);
+  for (var i = 0; i < keys.length; i++) {
+    if (Date.now() - _analysisCache[keys[i]].createdAt > ANALYSIS_CACHE_TTL) {
+      delete _analysisCache[keys[i]];
+    }
+  }
+}
+
+function getCachedAnalysis(bugId, userId) {
+  var entry = _analysisCache[bugId + ':' + userId];
+  if (!entry) return null;
+  if (Date.now() - entry.createdAt > ANALYSIS_CACHE_TTL) {
+    delete _analysisCache[bugId + ':' + userId];
+    return null;
+  }
+  return entry.data;
+}
+
+/**
+ * Validate and fix step selectors against known data-auto-ids.
+ * Strips invented data-auto-id selectors and falls back to CSS/text alternatives.
+ */
+function validateStepSelectors(steps, knownIds) {
+  if (!steps || !knownIds || knownIds.length === 0) return steps;
+  var idSet = {};
+  for (var ki = 0; ki < knownIds.length; ki++) {
+    idSet[knownIds[ki]] = true;
+  }
+  var autoIdRegex = /\[data-auto-id=["']([^"']+)["']\]/;
+  for (var si = 0; si < steps.length; si++) {
+    var step = steps[si];
+    if (!step || !step.selector) continue;
+
+    // Check primary selector
+    var primaryMatch = step.selector.match(autoIdRegex);
+    if (primaryMatch && !idSet[primaryMatch[1]]) {
+      console.log('[Repro] ⚠️ Step ' + (si + 1) + ': INVENTED data-auto-id "' + primaryMatch[1] + '" — replacing with fallback');
+      // Move to fallback
+      if (step.fallbackSelectors && step.fallbackSelectors.length > 0) {
+        // Find first fallback that isn't an invented data-auto-id
+        var replaced = false;
+        for (var fi = 0; fi < step.fallbackSelectors.length; fi++) {
+          var fbMatch = step.fallbackSelectors[fi].match(autoIdRegex);
+          if (!fbMatch || idSet[fbMatch[1]]) {
+            step.selector = step.fallbackSelectors[fi];
+            step.fallbackSelectors.splice(fi, 1);
+            replaced = true;
+            console.log('[Repro]   → Replaced with: ' + step.selector);
+            break;
+          }
+        }
+        if (!replaced) {
+          step.selector = step.fallbackSelectors[0];
+          step.fallbackSelectors.splice(0, 1);
+          console.log('[Repro]   → Replaced with first fallback: ' + step.selector);
+        }
+      }
+    }
+
+    // Also clean invented data-auto-ids from fallbackSelectors
+    if (step.fallbackSelectors) {
+      step.fallbackSelectors = step.fallbackSelectors.filter(function (fb) {
+        var fbm = fb.match(autoIdRegex);
+        if (fbm && !idSet[fbm[1]]) {
+          console.log('[Repro]   Removing invented fallback: ' + fb);
+          return false;
+        }
+        return true;
+      });
+    }
+  }
+  return steps;
+}
+
 // ── helpers ──────────────────────────────────────────────
 
 var MIME_TYPES = {
@@ -788,868 +874,939 @@ function handleRequest(req, res) {
           }
 
           function continueWithAnalysis() {
+          var aiModel = analyzeUser.aiModel || 'claude-opus-4-6';
+          var devServerUrl = analyzeUser.devServerUrl || '';
+          var _templateCtx = null;
+          var _componentRegistry = [];
+
           console.log('');
-          console.log('[STEP 3/6] 📂 Code scanning config:');
-          console.log('  Agent URL:', JSON.stringify(analyzeUser.agentUrl) || '(none — local mode)');
-          console.log('  Project dir:', JSON.stringify(analyzeUser.projectDir) || '(none)');
-          console.log('  AI model:', analyzeUser.aiModel || 'claude-opus-4-6 (default)');
+          console.log('[STEP 3/8] \uD83D\uDCC2 Analysis pipeline:');
+          console.log('  Agent:', JSON.stringify(analyzeUser.agentUrl) || '(local mode)');
+          console.log('  AI model:', aiModel);
           if (targetRoute) console.log('  Target route:', targetRoute);
 
-          // Helper: after code analysis, route to AI provider, then respond
-          // Routing order:
-          //   1. Copilot Bridge (free with Copilot license — Claude Opus 4.6 preferred)
-          //   2. GitHub Models API (for non-Claude models, uses PAT)
-          //   3. Anthropic Direct API (for Claude models, uses Anthropic key)
-          function respondWithAnalysis(result, agentError) {
+          // ================================================================
+          //  REPRODUCTION HELPER FUNCTIONS (hoisted — available everywhere)
+          // ================================================================
+
+          /**
+           * Build enhanced reproduction prompt with 4 layers:
+           *  L1: Ember 1.13 rendering knowledge base
+           *  L2: Component registry (auto-extracted metadata)
+           *  L3: Few-shot HBS-to-Puppeteer examples
+           *  L4: Two-phase output format (confidence + plan + steps + questions)
+           */
+          function buildInteractionStepsPrompt(bugTitle, bugDesc, templateCtx, componentRegistry) {
+            var lines = [];
+
+            // ── Layer 1: Ember 1.13 Rendering Knowledge Base ──
+            lines.push('You are helping reproduce a bug in an Ember.js 1.13.15 application by generating Puppeteer browser interaction steps.');
+            lines.push('');
+            lines.push('## CRITICAL: Ember 1.13.15 Rendering Rules');
+            lines.push('This app uses Ember 1.13.15 with HTMLBars. Understand how HBS templates render to DOM:');
+            lines.push('');
+            lines.push('### Component Rendering');
+            lines.push('- Each Ember component renders as a wrapper DOM element (default: `<div>`).');
+            lines.push('- `tagName: "span"` in component.js \u2192 renders as `<span>` instead of `<div>`.');
+            lines.push('- `tagName: ""` \u2192 tagless component, no wrapper element.');
+            lines.push('- `classNames: ["foo", "bar"]` \u2192 adds CSS classes `foo bar` to the wrapper element.');
+            lines.push('- `classNameBindings: ["isActive:active:inactive", "isOpen"]` \u2192 conditionally adds classes.');
+            lines.push('  - `"isActive:active:inactive"` \u2192 if isActive true: class "active", else: "inactive".');
+            lines.push('  - `"isOpen"` \u2192 if isOpen true: class "is-open" (dasherized property name).');
+            lines.push('- `attributeBindings: ["title", "disabled", "data-id:elementId"]` \u2192 binds properties to DOM attributes.');
+            lines.push('');
+            lines.push('### Template Elements');
+            lines.push('- `{{input value=text placeholder="..."}}` \u2192 `<input class="ember-text-field" ...>`.');
+            lines.push('- `{{textarea value=text}}` \u2192 `<textarea class="ember-text-area">`.');
+            lines.push('- `<button {{action "doSomething"}}>Text</button>` \u2192 `<button>` with click handler.');
+            lines.push('- `{{#link-to "route.name"}}Text{{/link-to}}` \u2192 `<a class="ember-view" href="...">`.');
+            lines.push('- `{{my-component prop=val}}` \u2192 check component registry below for DOM element/classes.');
+            lines.push('- `{{#each items as |item|}}...{{/each}}` \u2192 multiple DOM nodes, one per item.');
+            lines.push('- `{{#if condition}}...{{/if}}` \u2192 conditional rendering (absent if false).');
+            lines.push('');
+            lines.push('### CSS Selector Strategy (PRIORITY ORDER)');
+            lines.push('1. **FIRST CHOICE: data-auto-id** → `[data-auto-id="value"]`. This app places `data-auto-id` on ALL clickable and interactive elements. These are the MOST STABLE selectors. ALWAYS use them when available.');
+            lines.push('2. class-based selectors (.my-class) as fallback.');
+            lines.push('3. Other data attributes ([data-attr]) as fallback.');
+            lines.push('4. Components with classNames → use those exact classes as fallback selectors.');
+            lines.push('5. Ember auto-adds .ember-view to all component wrapper elements.');
+            lines.push('6. For {{input}} helpers, use .ember-text-field or surrounding component class.');
+            lines.push('- AVOID: auto-generated IDs (#ember123) — they change on every render.');
+            lines.push('- AVOID: XPath. Use CSS selectors only.');
+            lines.push('- When unsure about a selector, raise it in the "questions" field.');
+            lines.push('');
+            lines.push('**IMPORTANT: When a data-auto-id is available for an element, it MUST be the primary selector.**');
+            lines.push('Format: `[data-auto-id="the-value"]`');
+            lines.push('Example: `<button data-auto-id="save-btn" class="btn-primary">Save</button>` → selector: `[data-auto-id="save-btn"]`');
+            lines.push('');
+            lines.push('### 🚫 ABSOLUTE RULE: data-auto-id MUST come from the template');
+            lines.push('- You MUST **read the actual `data-auto-id` value from the HBS template code** shown below.');
+            lines.push('- The data-auto-id ALLOWLIST section below lists EVERY valid data-auto-id on this page.');
+            lines.push('- Do NOT assume, guess, or invent data-auto-id values. If you cannot find a data-auto-id for an element in the templates, that element does NOT have one — use a CSS class selector instead.');
+            lines.push('- WRONG: Guessing `[data-auto-id="save-button"]` because the button says "Save".');
+            lines.push('- RIGHT: Reading the template and finding `<button data-auto-id="btn-save-record">Save</button>` → `[data-auto-id="btn-save-record"]`.');
+            lines.push('- RIGHT: Template has `<button class="save-btn">Save</button>` (no data-auto-id) → use `.save-btn`.');
+            lines.push('');
+            lines.push('**Scan the HBS templates below VERY CAREFULLY for data-auto-id attributes.**');
+            lines.push('Every element with data-auto-id is an interactive element you can target reliably.');
+            lines.push('');
+            lines.push('### Form & Input Intelligence');
+            lines.push('When the page contains forms, you MUST analyze them thoroughly:');
+            lines.push('');
+            lines.push('1. **Identify ALL form fields** from the HBS templates:');
+            lines.push('   - `{{input value=... placeholder="..."}}` → text input');
+            lines.push('   - `{{textarea value=...}}` → textarea');
+            lines.push('   - `<select>` or `{{#x-select}}` → dropdown');
+            lines.push('   - `<input type="checkbox">` or `{{input type="checkbox"}}` → checkbox');
+            lines.push('   - `<input type="radio">` → radio button');
+            lines.push('   - `{{input type="date"}}`, `{{input type="number"}}` → typed inputs');
+            lines.push('');
+            lines.push('2. **Determine mandatory fields**: Look for:');
+            lines.push('   - `required=true` or `required` attribute in HBS');
+            lines.push('   - Validation rules in component JS (e.g., `if (!this.get("fieldName")) { error }`)');
+            lines.push('   - CSS classes like `.required`, `.mandatory`, `*` markers in labels');
+            lines.push('   - Controller/route `validate()` or `save()` methods that check for empty fields');
+            lines.push('');
+            lines.push('3. **Generate realistic test data**: For each field generate appropriate values:');
+            lines.push('   - Name fields: "bugtrack_test_user"');
+            lines.push('   - Email: "bugtrack_test@example.com"');
+            lines.push('   - Phone: "1234567890"');
+            lines.push('   - Description/text: "Automated test entry for bug reproduction"');
+            lines.push('   - Numbers: appropriate range values');
+            lines.push('   - Dates: current date or valid date string');
+            lines.push('   - Dropdowns: pick the first valid option visible in the template');
+            lines.push('   - Prefix ALL created entities/names with "bugtrack_test_"');
+            lines.push('');
+            lines.push('4. **Know correct vs incorrect input**: If the bug involves validation:');
+            lines.push('   - Identify what valid input looks like');
+            lines.push('   - Identify what the bug-triggering input looks like');
+            lines.push('   - Generate steps that trigger the exact buggy behavior');
+            lines.push('');
+            lines.push('5. **Ask questions about forms** when:');
+            lines.push('   - A field has no placeholder and the expected format is unclear');
+            lines.push('   - A dropdown has options loaded dynamically (not in template)');
+            lines.push('   - You cannot determine which fields are mandatory');
+            lines.push('   - The form submit button or save action is not obvious');
+            lines.push('');
+
+            // ── Bug Details ──
+            lines.push('## Bug');
+            lines.push('Title: ' + (bugTitle || 'Unknown'));
+            lines.push('Description: ' + (bugDesc || 'No description'));
+            lines.push('');
+
+            // Structured QA data
+            if (_parsedDesc) {
+              lines.push('## Structured QA Report');
+              if (_parsedDesc.page) lines.push('**Page:** ' + _parsedDesc.page);
+              if (_parsedDesc.steps && _parsedDesc.steps.length > 0) {
+                lines.push('**QA Reproduction Steps:**');
+                for (var qi = 0; qi < _parsedDesc.steps.length; qi++) {
+                  lines.push((qi + 1) + '. ' + _parsedDesc.steps[qi]);
+                }
+              }
+              if (_parsedDesc.expected) lines.push('**Expected:** ' + _parsedDesc.expected);
+              if (_parsedDesc.actual) lines.push('**Actual (bug):** ' + _parsedDesc.actual);
+              lines.push('');
+            }
+
+            // ── Layer 2: Component Registry ──
+            if (componentRegistry && componentRegistry.length > 0) {
+              lines.push('## Component Registry (Auto-Extracted from Source)');
+              lines.push('These are all components with their rendering metadata:');
+              lines.push('');
+              lines.push('| Component | Tag | CSS Classes | Key Actions | data-auto-ids |');
+              lines.push('|-----------|-----|-------------|-------------|---------------|');
+              for (var ci = 0; ci < componentRegistry.length && ci < 100; ci++) {
+                var comp = componentRegistry[ci];
+                var tag = comp.tagName || 'div';
+                var classes = (comp.classNames || []).join(', ') || '\u2014';
+                var acts = (comp.actions || []).slice(0, 5).join(', ') || '\u2014';
+                var autoIds = (comp.dataAutoIds || []).map(function (a) { return a.id; }).slice(0, 5).join(', ') || '\u2014';
+                lines.push('| ' + comp.name + ' | `<' + tag + '>` | ' + classes + ' | ' + acts + ' | ' + autoIds + ' |');
+              }
+              lines.push('');
+              lines.push('Use this registry to determine correct DOM elements and CSS classes for components in the templates.');
+              lines.push('');
+            }
+
+            // ── data-auto-id ALLOWLIST (extracted from all templates) ──
+            var knownAutoIds = [];
+            if (templateCtx && templateCtx.dataAutoIds && templateCtx.dataAutoIds.length > 0) {
+              lines.push('## ⚠️ STRICT data-auto-id ALLOWLIST (READ THIS FIRST)');
+              lines.push('');
+              lines.push('The following data-auto-id values were **extracted directly from the HBS source code** for this page.');
+              lines.push('These are the ONLY valid data-auto-id values that exist. **You MUST use them exactly as listed.**');
+              lines.push('');
+              lines.push('### 🚫 ABSOLUTE RULE: NEVER INVENT data-auto-id VALUES');
+              lines.push('- Do NOT guess or fabricate data-auto-id values.');
+              lines.push('- Do NOT modify, shorten, or change the casing of these IDs.');
+              lines.push('- If an element does NOT have a data-auto-id in the list below, use a CSS class selector instead.');
+              lines.push('- ONLY use `[data-auto-id="..."]` selectors for IDs that appear in the table below.');
+              lines.push('');
+              lines.push('### Valid data-auto-id values for this page:');
+              lines.push('');
+              lines.push('| # | data-auto-id (EXACT) | Selector to use | Element | CSS Classes | Context |');
+              lines.push('|---|---------------------|-----------------|---------|-------------|---------|');
+              for (var di = 0; di < templateCtx.dataAutoIds.length && di < 80; di++) {
+                var dai = templateCtx.dataAutoIds[di];
+                var daiSelector = '[data-auto-id="' + dai.id + '"]';
+                knownAutoIds.push(dai.id);
+                lines.push('| ' + (di + 1) + ' | `' + dai.id + '` | `' + daiSelector + '` | `<' + dai.tag + '>` | ' + (dai.classes || '\u2014') + ' | ' + (dai.text || '\u2014') + ' |');
+              }
+              lines.push('');
+              lines.push('**Total valid data-auto-ids: ' + templateCtx.dataAutoIds.length + '**');
+              lines.push('');
+              lines.push('For each step, LOOK UP the target element in this table. If you find it, copy the "Selector to use" column EXACTLY.');
+              lines.push('If the element is NOT in this table, it does NOT have a data-auto-id — use a CSS class selector instead.');
+              lines.push('');
+            }
+
+            // ── Template Context ──
+            if (templateCtx && templateCtx.template) {
+              lines.push('## Page Template (HBS)');
+              lines.push('File: ' + templateCtx.template.path);
+              lines.push('```hbs');
+              var tContent = templateCtx.template.content;
+              if (tContent.length > 6000) tContent = tContent.substring(0, 6000) + '\n{{!-- truncated --}}';
+              lines.push(tContent);
+              lines.push('```');
+              lines.push('');
+            }
+
+            if (templateCtx && templateCtx.componentTemplates && templateCtx.componentTemplates.length > 0) {
+              lines.push('## Component Templates');
+              templateCtx.componentTemplates.forEach(function (ct) {
+                lines.push('### ' + ct.name);
+                // Show data-auto-ids available in this component BEFORE the template
+                if (ct.dataAutoIds && ct.dataAutoIds.length > 0) {
+                  lines.push('**Available data-auto-ids in this component:** ' + ct.dataAutoIds.map(function (a) {
+                    return '`[data-auto-id="' + a.id + '"]` (' + a.tag + (a.text ? ', "' + a.text + '"' : '') + ')';
+                  }).join(', '));
+                } else {
+                  lines.push('**data-auto-ids:** None — use CSS class selectors for elements in this component.');
+                }
+                lines.push('**Template:** ' + (ct.path || ct.name + '/template.hbs'));
+                lines.push('```hbs');
+                var cContent = ct.content;
+                if (cContent.length > 4000) cContent = cContent.substring(0, 4000) + '\n{{!-- truncated --}}';
+                lines.push(cContent);
+                lines.push('```');
+                if (ct.jsContent) {
+                  lines.push('**Component JS:** ' + (ct.jsPath || ct.name + '/component.js'));
+                  lines.push('```js');
+                  var jsC = ct.jsContent;
+                  if (jsC.length > 3000) jsC = jsC.substring(0, 3000) + '\n// ... truncated ...';
+                  lines.push(jsC);
+                  lines.push('```');
+                }
+                lines.push('');
+              });
+            }
+
+            if (templateCtx && templateCtx.routeJS && templateCtx.routeJS.length > 0) {
+              lines.push('## Route/Controller JS');
+              templateCtx.routeJS.forEach(function (rj) {
+                lines.push('### ' + rj.path + ' (' + rj.type + ')');
+                lines.push('```js');
+                lines.push(rj.content);
+                lines.push('```');
+                lines.push('');
+              });
+            }
+
+            // ── Layer 3: Few-Shot Examples ──
+            lines.push('## Few-Shot Examples: HBS \u2192 Puppeteer Mapping');
+            lines.push('');
+            lines.push('### Example 1: Clicking a button with data-auto-id (PREFERRED)');
+            lines.push('HBS: `<button data-auto-id="save-record-btn" class="btn-save" {{action "saveRecord"}}>Save</button>`');
+            lines.push('Step: `{ "action": "click", "selector": "[data-auto-id=\\"save-record-btn\\"]", "fallbackSelectors": [".btn-save", "button.btn-save"], "textContent": "Save", "description": "Click Save button" }`');
+            lines.push('');
+            lines.push('### Example 2: Typing into an input with data-auto-id');
+            lines.push('HBS: `{{input value=searchQuery placeholder="Search..." class="search-input" data-auto-id="search-field"}}`');
+            lines.push('Step: `{ "action": "type", "selector": "[data-auto-id=\\"search-field\\"]", "text": "test query", "fallbackSelectors": [".search-input", "input.ember-text-field.search-input"], "textContent": "Search...", "description": "Type in search" }`');
+            lines.push('Note: {{input}} renders as `<input class="ember-text-field search-input">`.');
+            lines.push('');
+            lines.push('### Example 3: Clicking a component with class-based selectors (no data-auto-id)');
+            lines.push('Component JS: `classNames: ["dropdown-trigger", "header-dropdown"]`');
+            lines.push('Step: `{ "action": "click", "selector": ".dropdown-trigger", "fallbackSelectors": [".header-dropdown", "div.dropdown-trigger"], "textContent": "Menu", "description": "Open dropdown" }`');
+            lines.push('');
+            lines.push('### Example 4: Asserting text content');
+            lines.push('HBS: `<span data-auto-id="page-title" class="page-title">{{model.title}}</span>`');
+            lines.push('Assert: `{ "action": "assert", "selector": "[data-auto-id=\\"page-title\\"]", "attribute": "textContent", "expected": "Wrong Title", "compare": "contains", "fallbackSelectors": [".page-title", "span.page-title"], "textContent": "Wrong Title", "description": "Buggy title text" }`');
+            lines.push('');
+
+            // ── Layer 4: Two-Phase Output Format ──
+            lines.push('## Task');
+            lines.push('Analyze the bug and HBS templates thoroughly to generate a reproduction plan.');
+            lines.push('Your job is to be INTERACTIVE — analyze deeply, ask smart questions, and let the user guide you.');
+            lines.push('');
+            lines.push('Return a JSON object (NOT a plain array) with this structure:');
+            lines.push('```json');
+            lines.push('{');
+            lines.push('  "confidence": "high" | "medium" | "low",');
+            lines.push('  "plan": ["Step-by-step description of what the test will do"],');
+            lines.push('  "steps": [{ "action": "click", "selector": "...", "description": "..." }],');
+            lines.push('  "formAnalysis": {');
+            lines.push('    "hasForms": true,');
+            lines.push('    "fields": [');
+            lines.push('      { "name": "fieldName", "selector": ".field-class", "type": "text|select|checkbox|radio|textarea|date|number", "required": true, "testValue": "bugtrack_test_value", "notes": "why this value" }');
+            lines.push('    ],');
+            lines.push('    "submitSelector": ".save-btn",');
+            lines.push('    "submitAction": "saveRecord"');
+            lines.push('  },');
+            lines.push('  "questions": [');
+            lines.push('    { "id": "q1", "question": "What is X?", "reason": "I need to know because...", "options": ["A", "B"], "affectedSteps": [2, 5] }');
+            lines.push('  ],');
+            lines.push('  "uncertainSelectors": [');
+            lines.push('    { "selector": ".some-class", "reason": "Uncertain because...", "alternatives": [".other-class"] }');
+            lines.push('  ]');
+            lines.push('}');
+            lines.push('```');
+            lines.push('');
+            lines.push('### Confidence Levels:');
+            lines.push('- **high**: All selectors clear from templates/registry, steps straightforward.');
+            lines.push('- **medium**: Most selectors identifiable but 1-2 uncertain. Include questions.');
+            lines.push('- **low**: Multiple selectors unclear. Ask questions for all uncertain elements.');
+            lines.push('');
+            lines.push('### CRITICAL: Be Interactive — Ask Smart Questions');
+            lines.push('You MUST always generate meaningful questions. The user will review your plan before anything runs.');
+            lines.push('');
+            lines.push('**Always ask about:**');
+            lines.push('- The exact starting page/route: "Is the page at route X the correct starting point?"');
+            lines.push('- Any selectors you are not 100% certain about: "Does the button have class `.foo`?"');
+            lines.push('- Form fields with unclear mandatory status: "Is the Description field required?"');
+            lines.push('- Dynamic content: "What option should I select from the dropdown?"');
+            lines.push('- Navigation flow: "After clicking Save, does the page redirect or stay?"');
+            lines.push('- Environment state: "Does this page require existing data to be present first?"');
+            lines.push('- Bug trigger conditions: "Does this bug happen with any input or specific input?"');
+            lines.push('');
+            lines.push('**Question quality rules:**');
+            lines.push('- Each question should be specific and actionable');
+            lines.push('- Provide 2-4 clear options when possible');
+            lines.push('- Explain WHY you need the answer (the "reason" field)');
+            lines.push('- Reference which step numbers the answer affects ("affectedSteps")');
+            lines.push('- Minimum 2 questions, aim for 3-5 per plan');
+            lines.push('');
+            lines.push('ALWAYS provide best-guess "steps" even if you have questions.');
+            lines.push('If the user skips answering, these steps will be used directly.');
+            lines.push('');
+
+            // Standard step types
+            lines.push('### Available step types:');
+            lines.push('Each step MUST include `fallbackSelectors` and `textContent` for self-healing.');
+            lines.push('**Primary selector MUST be `[data-auto-id="..."]` when one exists in the template for that element.**');
+            lines.push('');
+            lines.push('- { "action": "click", "selector": "[data-auto-id=\\"btn-id\\"]", "fallbackSelectors": [".alt-class", "button.other"], "textContent": "visible button text", "description": "why" }');
+            lines.push('- { "action": "type", "selector": "[data-auto-id=\\"input-id\\"]", "text": "value to type", "fallbackSelectors": ["input.alt", ".field-class"], "textContent": "placeholder text", "description": "why" }');
+            lines.push('- { "action": "waitForSelector", "selector": "[data-auto-id=\\"element-id\\"]", "fallbackSelectors": [".alt"], "description": "why" }');
+            lines.push('- { "action": "select", "selector": "[data-auto-id=\\"dropdown-id\\"]", "value": "option-value", "fallbackSelectors": ["select.alt"], "textContent": "dropdown label", "description": "why" }');
+            lines.push('- { "action": "hover", "selector": "[data-auto-id=\\"hover-id\\"]", "fallbackSelectors": [".alt"], "textContent": "visible text", "description": "why" }');
+            lines.push('- { "action": "wait", "ms": 1000, "description": "why" }');
+            lines.push('- { "action": "screenshot", "name": "step_name", "description": "why" }');
+            lines.push('- { "action": "assert", "selector": "[data-auto-id=\\"assert-id\\"]", "attribute": "textContent|placeholder|value|class|...", "expected": "BUGGY value", "compare": "equals|contains", "fallbackSelectors": [".alt"], "textContent": "element text", "description": "what" }');
+            lines.push('');
+            lines.push('### CRITICAL: Self-Healing Fields');
+            lines.push('The Puppeteer engine uses self-healing: if the primary selector fails, it tries fallbackSelectors, then searches by textContent.');
+            lines.push('');
+            lines.push('**Selector priority for EVERY step:**');
+            lines.push('1. **Primary selector**: `[data-auto-id="..."]` — if the element has data-auto-id in the template, THIS is the primary selector. Period.');
+            lines.push('2. **fallbackSelectors**: Array of 2-4 alternative CSS selectors (by class, by parent+child, by attribute, by tag).');
+            lines.push('3. **textContent**: The visible text the element displays (for buttons: the label, for inputs: the placeholder). Last resort.');
+            lines.push('');
+            lines.push('For EVERY step with a selector, you MUST provide:');
+            lines.push('- **selector**: `[data-auto-id="..."]` when available, otherwise best CSS selector.');
+            lines.push('- **fallbackSelectors**: Array of 2-4 alternative CSS selectors.');
+            lines.push('- **textContent**: The visible text of the element.');
+            lines.push('');
+            lines.push('Example of good selectors for a Save button with data-auto-id:');
+            lines.push('```');
+            lines.push('"selector": "[data-auto-id=\\"save-record\\"]",');
+            lines.push('"fallbackSelectors": [".btn-save", ".save-button", "button.btn-primary", ".form-actions button"],');
+            lines.push('"textContent": "Save"');
+            lines.push('```');
+            lines.push('');
+
+            // Assert instructions
+            lines.push('### CRITICAL: Assert Steps');
+            lines.push('Include at least one "assert" step verifying the BUGGY condition.');
+            lines.push('The "expected" value = the INCORRECT/BUGGY value from the bug report.');
+            if (_parsedDesc && _parsedDesc.actual) {
+              lines.push('');
+              lines.push('For this bug:');
+              lines.push('ACTUAL (buggy): "' + _parsedDesc.actual + '"');
+              if (_parsedDesc.expected) lines.push('EXPECTED (correct): "' + _parsedDesc.expected + '"');
+              lines.push('Your assert "expected" should match the BUGGY value.');
+            }
+            lines.push('');
+
+            // Setup-Action-Verify
+            lines.push('### Setup-Action-Verify Pattern (for destructive bugs):');
+            lines.push('Phase 1 Setup: Create a TEST entity (prefix "bugtrack_test_").');
+            lines.push('Phase 2 Action: Perform the bug action on the test entity.');
+            lines.push('Phase 3 Verify: Assert the buggy behavior.');
+            lines.push('For display issues, skip setup and interact directly.');
+            lines.push('');
+            lines.push('Keep sequence practical: 5-20 steps. Return ONLY valid JSON, no markdown fences.');
+            lines.push('');
+
+            // ── Final Reminder: data-auto-id strictness ──
+            if (knownAutoIds.length > 0) {
+              lines.push('## ⚠️ FINAL REMINDER: data-auto-id RULES');
+              lines.push('Before you output JSON, verify EVERY selector:');
+              lines.push('- If your selector uses `[data-auto-id="X"]`, check that X is in this list: ' + knownAutoIds.map(function (id) { return '"' + id + '"'; }).join(', '));
+              lines.push('- If X is NOT in that list, it does NOT exist. Replace with a CSS class selector from the template.');
+              lines.push('- NEVER assume or guess data-auto-id values. They must come from the actual HBS templates shown above.');
+              lines.push('');
+            }
+
+            return { prompt: lines.join('\n'), knownAutoIds: knownAutoIds };
+          }
+
+          /**
+           * Parse AI response into reproduction plan object.
+           * Supports both new format (JSON object) and old format (JSON array).
+           */
+          function parseReproductionPlan(aiText) {
+            var empty = { confidence: 'low', plan: [], steps: [], questions: [], uncertainSelectors: [], formAnalysis: null };
+            if (!aiText) return empty;
+            var cleaned = aiText.trim();
+            cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '');
+
+            // Try new format: JSON object with confidence/plan/steps/questions
+            try {
+              var objMatch = cleaned.match(/\{[\s\S]*\}/);
+              if (objMatch) {
+                var parsed = JSON.parse(objMatch[0]);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                  return {
+                    confidence: parsed.confidence || 'medium',
+                    plan: Array.isArray(parsed.plan) ? parsed.plan : [],
+                    steps: Array.isArray(parsed.steps) ? parsed.steps.filter(function (s) {
+                      return s && s.action && typeof s.action === 'string';
+                    }) : [],
+                    questions: Array.isArray(parsed.questions) ? parsed.questions : [],
+                    uncertainSelectors: Array.isArray(parsed.uncertainSelectors) ? parsed.uncertainSelectors : [],
+                    formAnalysis: parsed.formAnalysis || null
+                  };
+                }
+              }
+            } catch (e) {
+              console.log('[Repro] JSON object parse failed:', e.message);
+            }
+
+            // Fallback: plain JSON array (old format)
+            try {
+              var arrayMatch = cleaned.match(/\[[\s\S]*\]/);
+              if (arrayMatch) {
+                var steps = JSON.parse(arrayMatch[0]);
+                if (Array.isArray(steps)) {
+                  return {
+                    confidence: 'medium',
+                    plan: [],
+                    steps: steps.filter(function (s) { return s && s.action; }),
+                    questions: [],
+                    uncertainSelectors: [],
+                    formAnalysis: null
+                  };
+                }
+              }
+            } catch (e2) {
+              console.log('[Repro] JSON array fallback failed:', e2.message);
+            }
+
+            return empty;
+          }
+
+          /**
+           * AI fallback chain for reproduction plan generation.
+           */
+          function tryStepsFallback(stepsPrompt, callback) {
+            var isClaude2 = githubAI.isClaudeModel(aiModel);
+            var claudeKey2 = analyzeUser.claudeApiKey || '';
+            var githubToken2 = analyzeUser.githubToken || '';
+
+            if (isClaude2 && claudeKey2) {
+              claudeClient.analyze(claudeKey2, stepsPrompt, { model: aiModel }, function (clErr, clResult) {
+                if (!clErr && clResult && clResult.text) {
+                  var plan = parseReproductionPlan(clResult.text);
+                  console.log('[Repro] \u2705 Anthropic:', plan.steps.length, 'steps, confidence:', plan.confidence);
+                  return callback(plan);
+                }
+                console.log('[Repro] \u26a0\ufe0f Anthropic fallback failed:', clErr ? clErr.message : 'empty');
+                callback(null);
+              });
+            } else if (!isClaude2 && githubToken2) {
+              githubAI.analyze(githubToken2, stepsPrompt, { model: aiModel }, function (ghErr, ghResult) {
+                if (!ghErr && ghResult && ghResult.text) {
+                  var plan = parseReproductionPlan(ghResult.text);
+                  console.log('[Repro] \u2705 GitHub Models:', plan.steps.length, 'steps, confidence:', plan.confidence);
+                  return callback(plan);
+                }
+                console.log('[Repro] \u26a0\ufe0f GitHub Models fallback failed:', ghErr ? ghErr.message : 'empty');
+                callback(null);
+              });
+            } else {
+              console.log('[Repro] \u26a0\ufe0f No AI fallback available');
+              callback(null);
+            }
+          }
+
+          /**
+           * Run a single reproduction attempt: generate script + execute it.
+           */
+          function runReproduction(steps, label, doneCallback) {
+            agentProxy.playwrightGenerate(
+              analyzeUser.agentUrl,
+              analyzeMatch[1],
+              bugData.bug.title || '',
+              bugData.bug.description || '',
+              devServerUrl,
+              analyzeUser.testUsername || '',
+              analyzeUser.testPassword || '',
+              targetRoute,
+              steps
+            ).then(function (genResult) {
+              console.log('[' + label + '] \u2705 Script generated:', genResult.testFile);
+              console.log('[' + label + '] \uD83C\uDFC3 Running reproduction...');
+              agentProxy.playwrightRun(analyzeUser.agentUrl, genResult.testFile).then(function (runResult) {
+                var bugConfirmed = !!runResult.bugConfirmed;
+                var assertions = runResult.assertions || [];
+                var navigationOk = runResult.navigationOk !== false;
+                var reproduced = bugConfirmed || !runResult.passed;
+                var status = 'not-reproduced';
+                if (bugConfirmed) { status = 'bug-confirmed'; }
+                else if (!navigationOk) { status = 'navigation-failed'; reproduced = false; }
+                else if (!runResult.passed) { status = 'test-errors'; }
+                else if (assertions.length > 0) { status = 'assertions-passed'; }
+                else { status = 'no-assertions'; }
+                console.log('[' + label + '] Result: status=' + status + ', passed=' + runResult.passed + ', bugConfirmed=' + bugConfirmed + ', ' + (runResult.duration || 0) + 'ms');
+                doneCallback({
+                  attempted: true, passed: runResult.passed, reproduced: reproduced,
+                  bugConfirmed: bugConfirmed, assertions: assertions, navigationOk: navigationOk,
+                  pageUrl: runResult.pageUrl || null, status: status, output: runResult.output,
+                  duration: runResult.duration, testFile: genResult.testFile,
+                  screenshotFile: runResult.screenshotFile, interactionSteps: steps.length
+                });
+              }).catch(function (runErr) {
+                console.log('[' + label + '] \u26a0\ufe0f Run failed:', runErr.message);
+                doneCallback({ attempted: true, passed: false, reproduced: false, error: runErr.message, interactionSteps: steps.length });
+              });
+            }).catch(function (genErr) {
+              console.log('[' + label + '] \u26a0\ufe0f Generate failed:', genErr.message);
+              doneCallback({ attempted: false, error: genErr.message });
+            });
+          }
+
+          /**
+           * Attempt reproduction with optional retry on failure.
+           */
+          function attemptReproduction(reproPlan, callback) {
+            if (!analyzeUser.agentUrl) return callback(null);
+            var steps = (reproPlan && reproPlan.steps) ? reproPlan.steps : [];
+            if (steps.length === 0) return callback(null);
+
             console.log('');
-            console.log('[STEP 4/6] ✅ Code scanning complete');
-            console.log('  Relevant files:', result.analysis ? result.analysis.relevantFiles.length : 0);
-            console.log('  Code matches:', result.analysis ? (result.analysis.codeMatches || []).length : 0);
-            console.log('  File contents loaded:', result.analysis ? (result.analysis.fileContents || []).length : 0);
-            console.log('  Prompt length:', result.prompt.length, 'chars');
-            if (agentError) console.log('  ⚠️ Agent error:', agentError);
+            console.log('[Repro] \uD83C\uDFAD Attempting reproduction with ' + steps.length + ' steps...');
+
+            runReproduction(steps, 'Repro', function (firstResult) {
+              // Check if retry is warranted
+              var shouldRetry = firstResult && firstResult.attempted &&
+                !firstResult.bugConfirmed &&
+                (firstResult.status === 'navigation-failed' || firstResult.status === 'test-errors' || firstResult.status === 'no-assertions') &&
+                steps.length > 0;
+
+              if (!shouldRetry) return callback(firstResult);
+
+              // ── Retry: ask AI for corrected steps ──
+              console.log('[Repro-retry] \uD83D\uDD04 First attempt was ' + firstResult.status + ' \u2014 asking AI for fix...');
+              var retryLines = [];
+              retryLines.push('A Puppeteer reproduction test just ran but the result was: ' + firstResult.status);
+              retryLines.push('');
+              retryLines.push('## Bug');
+              retryLines.push('Title: ' + (bugData.bug.title || ''));
+              retryLines.push('Description: ' + (bugData.bug.description || '').substring(0, 1500));
+              retryLines.push('');
+              retryLines.push('## Original Steps (that failed)');
+              retryLines.push('```json');
+              retryLines.push(JSON.stringify(steps, null, 2));
+              retryLines.push('```');
+              retryLines.push('');
+              retryLines.push('## Test Output');
+              retryLines.push('```');
+              retryLines.push((firstResult.output || '').substring(0, 3000));
+              retryLines.push('```');
+              if (firstResult.pageUrl) retryLines.push('Final URL: ' + firstResult.pageUrl);
+              retryLines.push('');
+              retryLines.push('## Task');
+              retryLines.push('Generate CORRECTED interaction steps that fix issues like wrong selectors, missing waits, wrong navigation.');
+              retryLines.push('Include at least one "assert" step checking the buggy condition.');
+              retryLines.push('Return ONLY a valid JSON array of corrected steps. No markdown fences.');
+              var retryPrompt = retryLines.join('\n');
+
+              var copilotBridge3 = require('./lib/copilot-bridge-client');
+              copilotBridge3.checkHealth(function (hErr3, hData3) {
+                function gotRetrySteps(retrySteps) {
+                  if (retrySteps && retrySteps.length > 0) {
+                    console.log('[Repro-retry] \u2705 Got ' + retrySteps.length + ' corrected steps \u2014 running...');
+                    runReproduction(retrySteps, 'Repro-retry', function (retryResult) {
+                      if (retryResult && (retryResult.bugConfirmed || retryResult.status === 'assertions-passed')) {
+                        retryResult.retried = true;
+                        return callback(retryResult);
+                      }
+                      firstResult.retryAttempted = true;
+                      callback(firstResult);
+                    });
+                  } else {
+                    firstResult.retryAttempted = true;
+                    callback(firstResult);
+                  }
+                }
+
+                function tryRetryFallback2() {
+                  var isClaude3 = githubAI.isClaudeModel(aiModel);
+                  var claudeKey3 = analyzeUser.claudeApiKey || '';
+                  var githubToken3 = analyzeUser.githubToken || '';
+                  if (isClaude3 && claudeKey3) {
+                    claudeClient.analyze(claudeKey3, retryPrompt, { model: aiModel }, function (e3, r3) {
+                      if (!e3 && r3 && r3.text) {
+                        var p3 = parseReproductionPlan(r3.text);
+                        return gotRetrySteps(p3.steps);
+                      }
+                      firstResult.retryAttempted = true; callback(firstResult);
+                    });
+                  } else if (!isClaude3 && githubToken3) {
+                    githubAI.analyze(githubToken3, retryPrompt, { model: aiModel }, function (e3, r3) {
+                      if (!e3 && r3 && r3.text) {
+                        var p3 = parseReproductionPlan(r3.text);
+                        return gotRetrySteps(p3.steps);
+                      }
+                      firstResult.retryAttempted = true; callback(firstResult);
+                    });
+                  } else {
+                    firstResult.retryAttempted = true; callback(firstResult);
+                  }
+                }
+
+                if (!hErr3 && hData3 && hData3.ok) {
+                  copilotBridge3.analyze(retryPrompt, aiModel, function (bErr3, bRes3) {
+                    if (!bErr3 && bRes3 && bRes3.text) {
+                      var p3 = parseReproductionPlan(bRes3.text);
+                      return gotRetrySteps(p3.steps);
+                    }
+                    tryRetryFallback2();
+                  });
+                } else {
+                  tryRetryFallback2();
+                }
+              });
+            });
+          }
+
+          /**
+           * Build "Reproduction Evidence" section to inject into AI fix prompt.
+           */
+          function buildReproductionEvidenceSection(repro) {
+            if (!repro || !repro.attempted) return '';
+            var lines = [];
+            lines.push('## \uD83E\uDDEA Reproduction Evidence (Automated Browser Test)');
+            lines.push('');
+            lines.push('> Collected by running an automated Puppeteer test against the dev server.');
+            lines.push('');
+            lines.push('**Status:** ' + repro.status);
+            if (repro.bugConfirmed) {
+              lines.push('');
+              lines.push('\u26a0\ufe0f **BUG CONFIRMED** \u2014 automated test found evidence matching the reported bug.');
+              lines.push('Your fix MUST address this confirmed behavior.');
+            } else if (repro.status === 'assertions-passed') {
+              lines.push('');
+              lines.push('\u2705 Assertions ran but buggy condition NOT found. May be intermittent or environment-specific.');
+            } else if (repro.status === 'navigation-failed') {
+              lines.push('');
+              lines.push('\u26a0\ufe0f Navigation to target page failed. Bug may involve routing or access issues.');
+            }
+            if (repro.pageUrl) lines.push('**Final URL:** `' + repro.pageUrl + '`');
+            lines.push('**Duration:** ' + (repro.duration || 0) + 'ms');
+            lines.push('');
+
+            if (repro.assertions && repro.assertions.length > 0) {
+              lines.push('### Assertion Results');
+              lines.push('');
+              for (var ai = 0; ai < repro.assertions.length; ai++) {
+                var a = repro.assertions[ai];
+                var statusTag = a.passed ? '\u2705 PASSED' : '\u274c FAILED';
+                if (a.status === 'element-not-found') statusTag = '\u26a0\ufe0f ELEMENT NOT FOUND';
+                lines.push((ai + 1) + '. **' + statusTag + '** \u2014 ' + (a.description || 'assertion'));
+                if (a.selector) lines.push('   - Selector: `' + a.selector + '`');
+                if (a.attribute) lines.push('   - Attribute: `' + a.attribute + '`');
+                if (a.expected !== undefined && a.expected !== null) lines.push('   - Expected (buggy): `' + a.expected + '`');
+                if (a.actual !== undefined && a.actual !== null) lines.push('   - Actual: `' + a.actual + '`');
+              }
+              lines.push('');
+            }
+
+            if (repro.output) {
+              var outLines = repro.output.split('\n').filter(function (l) {
+                var t = l.trim();
+                return t.length > 0 && t.indexOf('__REPRO_RESULT__') === -1;
+              });
+              if (outLines.length > 40) { outLines = outLines.slice(0, 40); outLines.push('... (truncated)'); }
+              if (outLines.length > 0) {
+                lines.push('### Browser Output');
+                lines.push('```');
+                lines.push(outLines.join('\n'));
+                lines.push('```');
+                lines.push('');
+              }
+            }
+
+            return lines.join('\n');
+          }
+
+          // ================================================================
+          //  respondWithAnalysis — cache results and respond to client
+          // ================================================================
+
+          function respondWithAnalysis(result, agentError, reproResult, reproPlan) {
+            console.log('');
+            console.log('[STEP] \u2705 Analysis pipeline complete');
+            console.log('  Files:', result.analysis ? result.analysis.relevantFiles.length : 0);
+            console.log('  Prompt:', result.prompt.length, 'chars');
+            if (agentError) console.log('  \u26a0\ufe0f Agent error:', agentError);
+            if (reproResult) console.log('  Reproduction:', reproResult.status || 'n/a');
+            if (reproPlan) console.log('  Plan: confidence=' + reproPlan.confidence + ', questions=' + reproPlan.questions.length);
+
             logger.codeScanComplete(analyzeMatch[1], {
               relevantFiles: result.analysis ? result.analysis.relevantFiles : [],
               codeMatches: result.analysis ? (result.analysis.codeMatches || []) : [],
               fileContents: result.analysis ? (result.analysis.fileContents || []) : [],
               prompt: result.prompt
             }, Date.now() - _analyzeStart, analyzeUser.agentUrl);
-            var copilotBridge = require('./lib/copilot-bridge-client');
-            // Default to claude-opus-4-6 for best results via Copilot Bridge
-            var aiModel = analyzeUser.aiModel || 'claude-opus-4-6';
-            var isClaude = githubAI.isClaudeModel(aiModel);
-            var githubToken = analyzeUser.githubToken || '';
-            var claudeKey = analyzeUser.claudeApiKey || '';
-            var devServerUrl = analyzeUser.devServerUrl || '';
 
-            function sendFinalResponse(aiResult, reproResult) {
-              console.log('');
-              console.log('[STEP 6/6] ✅ AI response received!');
-              console.log('  Model:', aiResult.model);
-              console.log('  Response length:', aiResult.text.length, 'chars');
-              console.log('  Usage:', JSON.stringify(aiResult.usage || {}));
-              console.log('  Total time:', ((Date.now() - _analyzeStart) / 1000).toFixed(1) + 's');
-              console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-              console.log('');
-              logger.aiResponseReceived(analyzeMatch[1], aiResult, Date.now() - _analyzeStart, {
-                provider: aiResult._provider || 'unknown'
-              });
-
-              // Save prompt log to agent if available
-              var promptLogData = {
-                bugId: analyzeMatch[1],
-                bugTitle: bugData.bug.title || '',
-                bugStatus: bugData.bug.status || '',
-                prompt: result.prompt,
-                aiModel: aiResult.model,
-                timestamp: new Date().toISOString()
-              };
-              if (analyzeUser.agentUrl) {
-                agentProxy.promptSave(analyzeUser.agentUrl, promptLogData).catch(function (e) {
-                  console.log('[analyze] Prompt log save failed:', e.message);
-                });
-              }
-
-              sendJSON(res, 200, {
-                prompt: result.prompt,
-                analysis: result.analysis,
-                bug: bugData.bug,
-                agentError: agentError || null,
-                bugImages: _bugImages.length,
-                aiFix: {
-                  text: aiResult.text,
-                  model: aiResult.model,
-                  usage: aiResult.usage
-                },
-                reproduction: reproResult || null
-              });
-            }
-
-            function sendError(errMsg, reproResult) {
-              console.error('');
-              console.error('[STEP 6/6] ❌ AI ERROR:', errMsg);
-              console.error('  Total time:', ((Date.now() - _analyzeStart) / 1000).toFixed(1) + 's');
-              console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-              console.error('');
-              logger.aiError(analyzeMatch[1], errMsg, { model: aiModel });
-              sendJSON(res, 200, {
-                prompt: result.prompt,
-                analysis: result.analysis,
-                bug: bugData.bug,
-                agentError: agentError || null,
-                bugImages: _bugImages.length,
-                aiFix: null,
-                aiError: errMsg,
-                reproduction: reproResult || null
-              });
-            }
-
-            // ── Layer 2: Build AI interaction steps prompt from template context ──
-            function buildInteractionStepsPrompt(bugTitle, bugDesc, templateCtx) {
-              var lines = [];
-              lines.push('You are helping reproduce a bug in an Ember.js 1.13.15 application by generating Puppeteer browser interaction steps.');
-              lines.push('');
-              lines.push('## Bug');
-              lines.push('Title: ' + (bugTitle || 'Unknown'));
-              lines.push('Description: ' + (bugDesc || 'No description'));
-              lines.push('');
-
-              // Include structured QA data (page, steps, expected/actual) if available
-              if (_parsedDesc) {
-                lines.push('## Structured QA Report');
-                if (_parsedDesc.page) lines.push('**Page:** ' + _parsedDesc.page);
-                if (_parsedDesc.steps && _parsedDesc.steps.length > 0) {
-                  lines.push('**QA Reproduction Steps:**');
-                  for (var qi = 0; qi < _parsedDesc.steps.length; qi++) {
-                    lines.push((qi + 1) + '. ' + _parsedDesc.steps[qi]);
-                  }
-                }
-                if (_parsedDesc.expected) lines.push('**Expected:** ' + _parsedDesc.expected);
-                if (_parsedDesc.actual) lines.push('**Actual (bug):** ' + _parsedDesc.actual);
-                lines.push('');
-              }
-
-              if (templateCtx.template) {
-                lines.push('## Page Template (HBS)');
-                lines.push('File: ' + templateCtx.template.path);
-                lines.push('```hbs');
-                // Limit template size to keep prompt manageable
-                var tContent = templateCtx.template.content;
-                if (tContent.length > 6000) tContent = tContent.substring(0, 6000) + '\n{{!-- truncated --}}';
-                lines.push(tContent);
-                lines.push('```');
-                lines.push('');
-              }
-
-              if (templateCtx.componentTemplates && templateCtx.componentTemplates.length > 0) {
-                lines.push('## Component Templates');
-                templateCtx.componentTemplates.forEach(function (ct) {
-                  lines.push('### ' + ct.name);
-                  lines.push('**Template:** ' + (ct.path || ct.name + '/template.hbs'));
-                  lines.push('```hbs');
-                  var cContent = ct.content;
-                  if (cContent.length > 4000) cContent = cContent.substring(0, 4000) + '\n{{!-- truncated --}}';
-                  lines.push(cContent);
-                  lines.push('```');
-                  if (ct.jsContent) {
-                    lines.push('**Component JS:** ' + (ct.jsPath || ct.name + '/component.js'));
-                    lines.push('```js');
-                    var jsC = ct.jsContent;
-                    if (jsC.length > 3000) jsC = jsC.substring(0, 3000) + '\n// ... truncated ...';
-                    lines.push(jsC);
-                    lines.push('```');
-                  }
-                  lines.push('');
-                });
-              }
-
-              if (templateCtx.routeJS && templateCtx.routeJS.length > 0) {
-                lines.push('## Route/Controller JS');
-                templateCtx.routeJS.forEach(function (rj) {
-                  lines.push('### ' + rj.path + ' (' + rj.type + ')');
-                  lines.push('```js');
-                  lines.push(rj.content);
-                  lines.push('```');
-                  lines.push('');
-                });
-              }
-
-              lines.push('## Task');
-              lines.push('Generate a JSON array of Puppeteer interaction steps to reproduce AND VERIFY this bug on the page.');
-              lines.push('Look at the HBS templates to identify interactive elements (buttons, inputs, links, dropdowns, etc.).');
-              lines.push('Create a realistic sequence of user interactions that would trigger the bug described above.');
-              lines.push('');
-              lines.push('CRITICAL: You MUST include at least one "assert" step that verifies the BUGGY condition.');
-              lines.push('The assert step checks whether the bug exists. If the assert matches, it means the bug IS present.');
-              lines.push('For example, if the bug says placeholder shows "Search Service" instead of "Search Services",');
-              lines.push('use: { "action": "assert", "selector": "input.search", "attribute": "placeholder", "expected": "Search Service", "description": "Bug: placeholder says Search Service" }');
-              lines.push('The "expected" value should be the INCORRECT/BUGGY value from the bug report.');
-              if (_parsedDesc && _parsedDesc.actual) {
-                lines.push('');
-                lines.push('**For this specific bug:**');
-                lines.push('The QA reports the ACTUAL (buggy) behavior is: "' + _parsedDesc.actual + '"');
-                if (_parsedDesc.expected) {
-                  lines.push('The EXPECTED (correct) behavior should be: "' + _parsedDesc.expected + '"');
-                }
-                lines.push('Your assert "expected" field should match the BUGGY value (the "actual" above).');
-              }
-              lines.push('');
-              lines.push('Each step must be one of:');
-              lines.push('- { "action": "click", "selector": "CSS selector", "description": "why" }');
-              lines.push('- { "action": "type", "selector": "CSS selector", "text": "text to type", "description": "why" }');
-              lines.push('- { "action": "waitForSelector", "selector": "CSS selector", "description": "why" }');
-              lines.push('- { "action": "select", "selector": "CSS selector", "value": "option value", "description": "why" }');
-              lines.push('- { "action": "hover", "selector": "CSS selector", "description": "why" }');
-              lines.push('- { "action": "wait", "ms": 1000, "description": "why" }');
-              lines.push('- { "action": "screenshot", "name": "step_name", "description": "why" }');
-              lines.push('- { "action": "assert", "selector": "CSS selector", "attribute": "placeholder|textContent|innerText|value|class|title|aria-label|etc", "expected": "expected BUGGY value", "compare": "equals|contains", "description": "what the assert verifies" }');
-              lines.push('');
-              lines.push('## IMPORTANT: Setup-Action-Verify Pattern for Destructive / Mutating Bugs');
-              lines.push('If the bug involves a DESTRUCTIVE or MUTATING action (delete, remove, disable, revoke, reset, unlink, detach, clear, etc.),');
-              lines.push('you MUST follow this 3-phase pattern:');
-              lines.push('');
-              lines.push('**Phase 1 — Setup:** Create a TEST entity first so there is something to act on.');
-              lines.push('- Navigate to the create/add page for that entity.');
-              lines.push('- Fill required fields using test data. Use the prefix "bugtrack_test_" for any name/label fields (e.g., bugtrack_test_svc_1").');
-              lines.push('- Submit/save and wait for creation to succeed.');
-              lines.push('- Add an assert step to confirm the test entity now appears in the list.');
-              lines.push('- Look at the HBS templates provided above to find the correct form fields, input selectors, and save button selectors.');
-              lines.push('');
-              lines.push('**Phase 2 — Action:** Perform the bug action on the TEST entity you just created.');
-              lines.push('- Find the test entity by its unique name (e.g., look for element containing "bugtrack_test_").');
-              lines.push('- Perform the destructive action (click delete button, confirm dialog, etc.).');
-              lines.push('');
-              lines.push('**Phase 3 — Verify:** Assert the expected buggy behavior.');
-              lines.push('- Add assert steps checking whether the bug is present (e.g., entity still appears after deletion = bug confirmed).');
-              lines.push('- Take a screenshot after the action.');
-              lines.push('');
-              lines.push('This pattern ensures we NEVER delete or modify real/existing data during reproduction.');
-              lines.push('For EDIT/UPDATE bugs, also create a test entity first, then edit it, then verify.');
-              lines.push('For READ-ONLY bugs (display issues, wrong text, styling), skip the setup phase and interact directly.');
-              lines.push('');
-              lines.push('Guidelines:');
-              lines.push('- Use CSS selectors that match the HBS template elements. Prefer class selectors, data attributes, or IDs.');
-              lines.push('- Ember uses {{action "name"}} — map these to their containing element\'s CSS class/ID.');
-              lines.push('- Include waitForSelector before interacting with elements that may load asynchronously.');
-              lines.push('- Add a screenshot step after key interactions (especially where the bug might manifest).');
-              lines.push('- ALWAYS include 1-3 "assert" steps that CHECK for the buggy condition described in the bug report.');
-              lines.push('- The assert "expected" value is the WRONG/BUGGY value (what the bug says is happening, not what SHOULD happen).');
-              lines.push('- If the bug is visual (wrong text, placeholder, label, CSS), assert the text/attribute.');
-              lines.push('- If the bug is behavioral (clicking X does Y wrong), assert the state after the action.');
-              lines.push('- For destructive bugs, follow the Setup-Action-Verify pattern above — never operate on existing real data.');
-              lines.push('- Keep the sequence practical: 5-20 steps typically suffice (setup phases may need more steps).');
-              lines.push('');
-              lines.push('Return ONLY a valid JSON array. No explanation, no markdown fences, no text before or after the JSON.');
-
-              return lines.join('\n');
-            }
-
-            /**
-             * Parse AI response into interaction steps JSON array.
-             * Handles cases where AI wraps response in markdown fences or adds text.
-             */
-            function parseInteractionSteps(aiText) {
-              if (!aiText) return [];
-              // Strip markdown fences if present
-              var cleaned = aiText.trim();
-              cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '');
-              // Try to find JSON array in the response
-              var arrayMatch = cleaned.match(/\[[\s\S]*\]/);
-              if (!arrayMatch) {
-                console.log('[Layer 2] Could not find JSON array in AI response');
-                return [];
-              }
-              try {
-                var steps = JSON.parse(arrayMatch[0]);
-                if (!Array.isArray(steps)) return [];
-                // Validate each step has required fields
-                return steps.filter(function (s) {
-                  return s && s.action && typeof s.action === 'string';
-                });
-              } catch (e) {
-                console.log('[Layer 2] JSON parse error:', e.message);
-                return [];
-              }
-            }
-
-            /**
-             * Get AI-generated interaction steps using template context.
-             * Calls: agent (template context) → AI (interaction steps) → callback(steps[])
-             */
-            function getInteractionSteps(callback) {
-              if (!analyzeUser.agentUrl || !targetRoute) {
-                return callback([]); // No agent or no route — skip
-              }
-
-              // ── Check for parsed QA steps first (skip AI if available) ──
-              if (_parsedDesc && _parsedDesc.steps && _parsedDesc.steps.length > 0) {
-                console.log('[Layer 2] 📋 Using', _parsedDesc.steps.length, 'parsed QA steps (skipping AI step generation)');
-                // Convert QA text steps into Puppeteer-compatible step objects
-                var qaSteps = _parsedDesc.steps.map(function (stepText, idx) {
-                  var step = { description: stepText };
-                  // Try to detect action type from step text
-                  var lower = stepText.toLowerCase();
-                  if (lower.match(/^(?:click|press|tap)\s/i)) {
-                    step.action = 'click';
-                    step.selector = ''; // Will be resolved by template matching in agent
-                    step.hint = stepText.replace(/^(?:click|press|tap)\s+(?:on\s+)?(?:the\s+)?/i, '');
-                  } else if (lower.match(/^(?:type|enter|input|fill)\s/i)) {
-                    step.action = 'type';
-                    step.selector = '';
-                    var typeMatch = stepText.match(/(?:type|enter|input|fill)\s+["']([^"']+)["']/i);
-                    step.text = typeMatch ? typeMatch[1] : '';
-                    step.hint = stepText.replace(/^(?:type|enter|input|fill)\s+(?:in\s+)?(?:the\s+)?/i, '');
-                  } else if (lower.match(/^(?:select|choose|pick)\s/i)) {
-                    step.action = 'select';
-                    step.selector = '';
-                    step.hint = stepText.replace(/^(?:select|choose|pick)\s+/i, '');
-                  } else if (lower.match(/^(?:hover|mouse\s*over)\s/i)) {
-                    step.action = 'hover';
-                    step.selector = '';
-                    step.hint = stepText.replace(/^(?:hover|mouse\s*over)\s+(?:on\s+)?(?:the\s+)?/i, '');
-                  } else if (lower.match(/^(?:wait|pause)/i)) {
-                    step.action = 'wait';
-                    step.ms = 2000;
-                  } else if (lower.match(/^(?:navigate|go\s+to|open)/i)) {
-                    step.action = 'navigate';
-                    step.hint = stepText.replace(/^(?:navigate\s+to|go\s+to|open)\s+(?:the\s+)?/i, '');
-                  } else if (lower.match(/^(?:refresh|reload)/i)) {
-                    step.action = 'reload';
-                  } else {
-                    // Generic step — let AI resolve it
-                    step.action = 'click';
-                    step.selector = '';
-                    step.hint = stepText;
-                  }
-                  return step;
-                });
-                // Add screenshot at the end to capture bug state
-                qaSteps.push({ action: 'screenshot', name: 'after_steps', description: 'Capture state after QA steps' });
-                qaSteps.forEach(function (s, idx) {
-                  console.log('[Layer 2]   Parsed step', (idx + 1) + ':', s.action, '-', s.description || s.hint || '');
-                });
-                return callback(qaSteps);
-              }
-
-              console.log('[Layer 2] 🧠 Getting template context for route:', targetRoute);
-              agentProxy.getTemplateContext(analyzeUser.agentUrl, targetRoute).then(function (templateCtx) {
-                if (!templateCtx.hasTemplate) {
-                  console.log('[Layer 2] ⚠️ No HBS template found for route — skipping interaction steps');
-                  return callback([]);
-                }
-                console.log('[Layer 2] ✅ Template context received:',
-                  templateCtx.totalTemplates, 'templates,',
-                  (templateCtx.routeJS || []).length, 'JS files');
-
-                // Build AI prompt
-                var stepsPrompt = buildInteractionStepsPrompt(
-                  bugData.bug.title || '',
-                  bugData.bug.description || '',
-                  templateCtx
-                );
-                console.log('[Layer 2] 📝 Interaction steps prompt:', stepsPrompt.length, 'chars');
-
-                // Call AI for interaction steps (use same routing as main analysis)
-                console.log('[Layer 2] 🤖 Asking AI for interaction steps...');
-                var copilotBridge = require('./lib/copilot-bridge-client');
-                copilotBridge.checkHealth(function (hErr, hData) {
-                  if (!hErr && hData && hData.ok) {
-                    copilotBridge.analyze(stepsPrompt, aiModel, function (bErr, bResult) {
-                      if (!bErr && bResult && bResult.text) {
-                        var steps = parseInteractionSteps(bResult.text);
-                        console.log('[Layer 2] ✅ AI returned', steps.length, 'interaction steps');
-                        steps.forEach(function (s, idx) {
-                          console.log('[Layer 2]   Step', (idx + 1) + ':', s.action, s.selector || '', '-', s.description || '');
-                        });
-                        return callback(steps);
-                      }
-                      console.log('[Layer 2] ⚠️ Copilot Bridge failed for steps:', bErr ? bErr.message : 'empty response');
-                      // Try fallback
-                      tryStepsFallback(stepsPrompt, callback);
-                    });
-                  } else {
-                    tryStepsFallback(stepsPrompt, callback);
-                  }
-                });
-              }).catch(function (tErr) {
-                console.log('[Layer 2] ⚠️ Template context failed:', tErr.message);
-                callback([]);
-              });
-            }
-
-            function tryStepsFallback(stepsPrompt, callback) {
-              var isClaude2 = githubAI.isClaudeModel(aiModel);
-              var claudeKey2 = analyzeUser.claudeApiKey || '';
-              var githubToken2 = analyzeUser.githubToken || '';
-
-              if (isClaude2 && claudeKey2) {
-                claudeClient.analyze(claudeKey2, stepsPrompt, { model: aiModel }, function (clErr, clResult) {
-                  if (!clErr && clResult && clResult.text) {
-                    var steps = parseInteractionSteps(clResult.text);
-                    console.log('[Layer 2] ✅ Anthropic returned', steps.length, 'interaction steps');
-                    return callback(steps);
-                  }
-                  console.log('[Layer 2] ⚠️ Anthropic fallback failed:', clErr ? clErr.message : 'empty');
-                  callback([]);
-                });
-              } else if (!isClaude2 && githubToken2) {
-                githubAI.analyze(githubToken2, stepsPrompt, { model: aiModel }, function (ghErr, ghResult) {
-                  if (!ghErr && ghResult && ghResult.text) {
-                    var steps = parseInteractionSteps(ghResult.text);
-                    console.log('[Layer 2] ✅ GitHub Models returned', steps.length, 'interaction steps');
-                    return callback(steps);
-                  }
-                  console.log('[Layer 2] ⚠️ GitHub Models fallback failed:', ghErr ? ghErr.message : 'empty');
-                  callback([]);
-                });
-              } else {
-                console.log('[Layer 2] ⚠️ No AI fallback available for interaction steps');
-                callback([]);
-              }
-            }
-
-            // Step 0: Try browser reproduction (if agent is available)
-            // Supports retry: if first attempt fails/inconclusive, ask AI for corrected steps
-            function attemptReproduction(callback) {
-              if (!analyzeUser.agentUrl) {
-                return callback(null); // No agent — skip reproduction
-              }
-
-              // Layer 2: Get AI interaction steps first, then generate + run script
-              console.log('');
-              console.log('[STEP 5a] 🎭 Attempting Playwright browser reproduction...');
-              if (targetRoute) console.log('[STEP 5a] 📍 Target route:', targetRoute);
-
-              getInteractionSteps(function (interactionSteps) {
-                if (interactionSteps.length > 0) {
-                  console.log('[STEP 5a] 🧠 Using', interactionSteps.length, 'AI-generated interaction steps');
-                } else {
-                  console.log('[STEP 5a] ℹ️ No interaction steps — observe-only mode');
-                }
-
-                // Run the reproduction for a given set of steps and callback with result
-                function runReproduction(steps, label, doneCallback) {
-                  agentProxy.playwrightGenerate(
-                    analyzeUser.agentUrl,
-                    analyzeMatch[1],
-                    bugData.bug.title || '',
-                    bugData.bug.description || '',
-                    devServerUrl,
-                    analyzeUser.testUsername || '',
-                    analyzeUser.testPassword || '',
-                    targetRoute,
-                    steps
-                  ).then(function (genResult) {
-                    console.log('[' + label + '] ✅ Reproduction script generated:', genResult.testFile);
-                    console.log('[' + label + '] 🏃 Running reproduction script...');
-                    agentProxy.playwrightRun(analyzeUser.agentUrl, genResult.testFile).then(function (runResult) {
-                      var bugConfirmed = !!runResult.bugConfirmed;
-                      var assertions = runResult.assertions || [];
-                      var navigationOk = runResult.navigationOk !== false;
-                      var reproduced = bugConfirmed || !runResult.passed;
-                      var status = 'not-reproduced';
-                      if (bugConfirmed) {
-                        status = 'bug-confirmed';
-                        console.log('[' + label + '] 🔴 Bug CONFIRMED by assertion(s)');
-                      } else if (!navigationOk) {
-                        status = 'navigation-failed';
-                        console.log('[' + label + '] ⚠️ Navigation failed — test inconclusive');
-                        reproduced = false;
-                      } else if (!runResult.passed) {
-                        status = 'test-errors';
-                        console.log('[' + label + '] ⚠️ Test had errors (may or may not indicate bug)');
-                      } else if (assertions.length > 0) {
-                        status = 'assertions-passed';
-                        console.log('[' + label + '] ✅ Assertions ran — bug condition NOT found');
-                      } else {
-                        status = 'no-assertions';
-                        console.log('[' + label + '] ℹ️ No assertions — test completed without verification');
-                      }
-                      console.log('[' + label + '] Result — status:', status, 'passed:', runResult.passed, 'bugConfirmed:', bugConfirmed, 'duration:', runResult.duration + 'ms');
-                      doneCallback({
-                        attempted: true,
-                        passed: runResult.passed,
-                        reproduced: reproduced,
-                        bugConfirmed: bugConfirmed,
-                        assertions: assertions,
-                        navigationOk: navigationOk,
-                        pageUrl: runResult.pageUrl || null,
-                        status: status,
-                        output: runResult.output,
-                        duration: runResult.duration,
-                        testFile: genResult.testFile,
-                        screenshotFile: runResult.screenshotFile,
-                        interactionSteps: steps.length
-                      });
-                    }).catch(function (runErr) {
-                      console.log('[' + label + '] ⚠️ Reproduction run failed:', runErr.message);
-                      doneCallback({
-                        attempted: true,
-                        passed: false,
-                        reproduced: false,
-                        error: runErr.message,
-                        interactionSteps: steps.length
-                      });
-                    });
-                  }).catch(function (genErr) {
-                    console.log('[' + label + '] ⚠️ Reproduction generate failed:', genErr.message);
-                    doneCallback({
-                      attempted: false,
-                      error: genErr.message
-                    });
-                  });
-                }
-
-                // ── First attempt ──
-                runReproduction(interactionSteps, 'STEP 5a', function (firstResult) {
-                  // Check if retry is warranted (navigation-failed, test-errors, or no-assertions)
-                  var shouldRetry = firstResult && firstResult.attempted &&
-                    !firstResult.bugConfirmed &&
-                    (firstResult.status === 'navigation-failed' || firstResult.status === 'test-errors' || firstResult.status === 'no-assertions') &&
-                    interactionSteps.length > 0;
-
-                  if (!shouldRetry) {
-                    return callback(firstResult);
-                  }
-
-                  // ── Retry: ask AI for corrected steps using first attempt's output ──
-                  console.log('');
-                  console.log('[STEP 5a-retry] 🔄 First reproduction attempt was', firstResult.status, '— asking AI for corrected steps...');
-
-                  var retryPromptLines = [];
-                  retryPromptLines.push('A Puppeteer browser reproduction test for a bug just ran but the result was: ' + firstResult.status + '.');
-                  retryPromptLines.push('');
-                  retryPromptLines.push('## Bug');
-                  retryPromptLines.push('Title: ' + (bugData.bug.title || ''));
-                  retryPromptLines.push('Description: ' + (bugData.bug.description || '').substring(0, 1500));
-                  retryPromptLines.push('');
-                  retryPromptLines.push('## Original Interaction Steps (that failed)');
-                  retryPromptLines.push('```json');
-                  retryPromptLines.push(JSON.stringify(interactionSteps, null, 2));
-                  retryPromptLines.push('```');
-                  retryPromptLines.push('');
-                  retryPromptLines.push('## Test Output');
-                  retryPromptLines.push('```');
-                  var retryOutput = (firstResult.output || '').substring(0, 3000);
-                  retryPromptLines.push(retryOutput);
-                  retryPromptLines.push('```');
-                  if (firstResult.pageUrl) retryPromptLines.push('Final page URL: ' + firstResult.pageUrl);
-                  retryPromptLines.push('');
-                  retryPromptLines.push('## Task');
-                  retryPromptLines.push('Based on the failure output above, generate CORRECTED interaction steps. Fix issues like:');
-                  retryPromptLines.push('- Wrong CSS selectors (element not found → use broader/different selector)');
-                  retryPromptLines.push('- Missing wait steps (element not yet rendered → add waitForSelector)');
-                  retryPromptLines.push('- Wrong page state (need to click/navigate somewhere first)');
-                  retryPromptLines.push('- Navigation errors (wrong route or URL)');
-                  retryPromptLines.push('');
-                  retryPromptLines.push('IMPORTANT: Include at least one "assert" step that checks for the buggy condition.');
-                  retryPromptLines.push('Return ONLY a valid JSON array of corrected steps. No markdown fences, no explanation.');
-
-                  var retryPromptText = retryPromptLines.join('\n');
-                  console.log('[STEP 5a-retry] Retry prompt:', retryPromptText.length, 'chars');
-
-                  // Send to AI for corrected steps
-                  var copilotBridge2 = require('./lib/copilot-bridge-client');
-                  copilotBridge2.checkHealth(function (hErr2, hData2) {
-                    function gotRetrySteps(retrySteps) {
-                      if (retrySteps && retrySteps.length > 0) {
-                        console.log('[STEP 5a-retry] ✅ Got', retrySteps.length, 'corrected steps — running retry...');
-                        retrySteps.forEach(function (s, idx) {
-                          console.log('[STEP 5a-retry]   Step', (idx + 1) + ':', s.action, s.selector || '', '-', s.description || '');
-                        });
-                        runReproduction(retrySteps, 'STEP 5a-retry', function (retryResult) {
-                          // Use the better result (prefer confirmed or assertions-passed)
-                          if (retryResult && retryResult.bugConfirmed) {
-                            console.log('[STEP 5a-retry] 🔴 Bug confirmed on retry!');
-                            retryResult.retried = true;
-                            return callback(retryResult);
-                          }
-                          if (retryResult && retryResult.status === 'assertions-passed') {
-                            console.log('[STEP 5a-retry] ✅ Assertions passed on retry');
-                            retryResult.retried = true;
-                            return callback(retryResult);
-                          }
-                          // Retry wasn't better — use first result
-                          console.log('[STEP 5a-retry] Retry result:', retryResult ? retryResult.status : 'failed', '— using first attempt result');
-                          firstResult.retryAttempted = true;
-                          callback(firstResult);
-                        });
-                      } else {
-                        console.log('[STEP 5a-retry] ⚠️ No corrected steps returned — using first attempt result');
-                        firstResult.retryAttempted = true;
-                        callback(firstResult);
-                      }
-                    }
-
-                    function tryRetryFallback() {
-                      var isClaude3 = githubAI.isClaudeModel(aiModel);
-                      var claudeKey3 = analyzeUser.claudeApiKey || '';
-                      var githubToken3 = analyzeUser.githubToken || '';
-                      if (isClaude3 && claudeKey3) {
-                        claudeClient.analyze(claudeKey3, retryPromptText, { model: aiModel }, function (err3, res3) {
-                          if (!err3 && res3 && res3.text) return gotRetrySteps(parseInteractionSteps(res3.text));
-                          firstResult.retryAttempted = true;
-                          callback(firstResult);
-                        });
-                      } else if (!isClaude3 && githubToken3) {
-                        githubAI.analyze(githubToken3, retryPromptText, { model: aiModel }, function (err3, res3) {
-                          if (!err3 && res3 && res3.text) return gotRetrySteps(parseInteractionSteps(res3.text));
-                          firstResult.retryAttempted = true;
-                          callback(firstResult);
-                        });
-                      } else {
-                        firstResult.retryAttempted = true;
-                        callback(firstResult);
-                      }
-                    }
-
-                    if (!hErr2 && hData2 && hData2.ok) {
-                      copilotBridge2.analyze(retryPromptText, aiModel, function (bErr2, bResult2) {
-                        if (!bErr2 && bResult2 && bResult2.text) {
-                          return gotRetrySteps(parseInteractionSteps(bResult2.text));
-                        }
-                        tryRetryFallback();
-                      });
-                    } else {
-                      tryRetryFallback();
-                    }
-                  });
-                });
-              });
-            }
-
-            // ── Build a "Reproduction Evidence" section to inject into the AI prompt ──
-            function buildReproductionEvidenceSection(repro) {
-              if (!repro || !repro.attempted) return '';
-              var lines = [];
-              lines.push('## 🧪 Reproduction Evidence (Automated Browser Test)');
-              lines.push('');
-              lines.push('> The following data was collected by running an automated Puppeteer browser test');
-              lines.push('> against the development server. Use this evidence to validate your analysis');
-              lines.push('> and focus on the confirmed bug behavior.');
-              lines.push('');
-              lines.push('**Reproduction Status:** ' + repro.status);
-              if (repro.bugConfirmed) {
-                lines.push('');
-                lines.push('⚠️ **BUG CONFIRMED** — the automated test found evidence matching the reported bug.');
-                lines.push('The assertions below matched the buggy condition. Your fix MUST address this confirmed behavior.');
-              } else if (repro.status === 'assertions-passed') {
-                lines.push('');
-                lines.push('✅ Assertions ran but the buggy condition was NOT found. The bug may be intermittent,');
-                lines.push('environment-specific, or already partially fixed. Still analyze the code for the root cause.');
-              } else if (repro.status === 'navigation-failed') {
-                lines.push('');
-                lines.push('⚠️ Navigation to the target page failed. The bug may involve routing or access issues.');
-              }
-              if (repro.pageUrl) {
-                lines.push('**Final Page URL:** `' + repro.pageUrl + '`');
-              }
-              lines.push('**Test Duration:** ' + (repro.duration || 0) + 'ms');
-              lines.push('');
-
-              // Detailed assertion results
-              if (repro.assertions && repro.assertions.length > 0) {
-                lines.push('### Assertion Results');
-                lines.push('');
-                for (var ai = 0; ai < repro.assertions.length; ai++) {
-                  var a = repro.assertions[ai];
-                  var statusTag = a.passed ? '✅ PASSED' : '❌ FAILED';
-                  if (a.status === 'element-not-found') statusTag = '⚠️ ELEMENT NOT FOUND';
-                  lines.push((ai + 1) + '. **' + statusTag + '** — ' + (a.description || 'assertion'));
-                  if (a.selector) lines.push('   - Selector: `' + a.selector + '`');
-                  if (a.attribute) lines.push('   - Attribute: `' + a.attribute + '`');
-                  if (a.expected !== undefined && a.expected !== null) lines.push('   - Expected (buggy value): `' + a.expected + '`');
-                  if (a.actual !== undefined && a.actual !== null) lines.push('   - Actual value found: `' + a.actual + '`');
-                  if (a.status === 'element-not-found') {
-                    lines.push('   - ⚠️ The element was not present on the page. The component may not be rendering or the selector is wrong.');
-                  }
-                }
-                lines.push('');
-              }
-
-              // Trimmed Puppeteer output (useful error messages, console logs)
-              if (repro.output) {
-                var outputLines = repro.output.split('\n');
-                // Filter for useful lines (skip blank and redundant lines)
-                var usefulLines = outputLines.filter(function (line) {
-                  var trimmed = line.trim();
-                  return trimmed.length > 0 && trimmed.indexOf('__REPRO_RESULT__') === -1;
-                });
-                if (usefulLines.length > 40) {
-                  usefulLines = usefulLines.slice(0, 40);
-                  usefulLines.push('... (output truncated)');
-                }
-                if (usefulLines.length > 0) {
-                  lines.push('### Browser Test Output');
-                  lines.push('```');
-                  lines.push(usefulLines.join('\n'));
-                  lines.push('```');
-                  lines.push('');
-                }
-              }
-
-              return lines.join('\n');
-            }
-
-            // Run reproduction first, then AI analysis
-            attemptReproduction(function (reproResult) {
-            logger.reproAttempt(analyzeMatch[1], reproResult);
-
-            // If bug was NOT reproduced (assertions ran and passed), skip code fix
-            if (reproResult && reproResult.attempted && !reproResult.bugConfirmed && !reproResult.reproduced &&
-                reproResult.status === 'assertions-passed') {
-              console.log('');
-              console.log('[STEP 5/6] ✅ Bug not reproduced — skipping AI code fix generation');
-              console.log('  Assertions confirmed the bug is NOT present');
-              console.log('  Total time:', ((Date.now() - _analyzeStart) / 1000).toFixed(1) + 's');
-              console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-              return sendJSON(res, 200, {
-                prompt: result.prompt,
-                analysis: result.analysis,
-                bug: bugData.bug,
-                agentError: agentError || null,
-                bugImages: _bugImages.length,
-                aiFix: null,
-                fixSkipped: 'Bug was not reproduced — assertions verified the bug condition is not present. No code fix needed.',
-                reproduction: reproResult
-              });
-            }
-
-            // ── Inject reproduction evidence into AI prompt (before sending to AI) ──
+            // Inject reproduction evidence into prompt (for /fix endpoint use)
             if (reproResult && reproResult.attempted) {
               var reproEvidence = buildReproductionEvidenceSection(reproResult);
               if (reproEvidence) {
-                // Insert the evidence BEFORE the "What You Must Do" section so AI prioritizes it
                 var taskMarker = '## What You Must Do';
                 var markerIdx = result.prompt.indexOf(taskMarker);
                 if (markerIdx > 0) {
                   result.prompt = result.prompt.substring(0, markerIdx) + reproEvidence + '\n' + result.prompt.substring(markerIdx);
                 } else {
-                  // Fallback: append before coding standards
                   result.prompt = result.prompt + '\n' + reproEvidence;
                 }
-                console.log('[STEP 5b] 📋 Injected reproduction evidence into AI prompt (' + reproEvidence.length + ' chars)');
-                console.log('  Updated prompt length:', result.prompt.length, 'chars');
+                console.log('  \uD83D\uDCCB Injected repro evidence (' + reproEvidence.length + ' chars)');
               }
             }
 
-            // ── Inject reproduction screenshot into vision images ──
+            // Inject reproduction screenshot into vision images
             if (reproResult && reproResult.screenshotFile) {
               try {
-                // Screenshots are now in ~/Documents/.zoho-bug-track-logs/reproductions/
-                var _docsDir = require('os').homedir();
-                var _dPath = require('path').join(_docsDir, 'Documents');
-                if (!require('fs').existsSync(_dPath)) _dPath = _docsDir;
-                var reproScreenshotPath = require('path').join(_dPath, '.zoho-bug-track-logs', 'reproductions', reproResult.screenshotFile);
-                if (require('fs').existsSync(reproScreenshotPath)) {
-                  var screenshotData = require('fs').readFileSync(reproScreenshotPath);
-                  var screenshotBase64 = screenshotData.toString('base64');
-                  if (screenshotBase64.length < 5 * 1024 * 1024) { // under 5MB base64
-                    _bugImages.push({
-                      name: 'reproduction_screenshot.png',
-                      mimeType: 'image/png',
-                      base64: screenshotBase64
-                    });
-                    console.log('[STEP 5b] 📸 Added reproduction screenshot to vision images (' + Math.round(screenshotBase64.length / 1024) + ' KB)');
+                var _homeDir = require('os').homedir();
+                var _docsPath = require('path').join(_homeDir, 'Documents');
+                if (!require('fs').existsSync(_docsPath)) _docsPath = _homeDir;
+                var _ssPath = require('path').join(_docsPath, '.zoho-bug-track-logs', 'reproductions', reproResult.screenshotFile);
+                if (require('fs').existsSync(_ssPath)) {
+                  var _ssData = require('fs').readFileSync(_ssPath);
+                  var _ssB64 = _ssData.toString('base64');
+                  if (_ssB64.length < 5 * 1024 * 1024) {
+                    _bugImages.push({ name: 'reproduction_screenshot.png', mimeType: 'image/png', base64: _ssB64 });
+                    console.log('  \uD83D\uDCF8 Added repro screenshot to vision images');
                   }
                 }
               } catch (ssErr) {
-                console.log('[STEP 5b] ⚠️ Could not read reproduction screenshot:', ssErr.message);
+                console.log('  \u26a0\ufe0f Screenshot read error:', ssErr.message);
               }
             }
 
-            // Step 1: Try Copilot Bridge first (free, works for Claude + GPT-4o + more)
-            console.log('');
-            console.log('[STEP 5/6] 🤖 Sending prompt to AI...');
-            console.log('  Checking Copilot Bridge...');
-            logger.aiPromptSent(analyzeMatch[1], result.prompt, {
-              model: aiModel,
-              provider: 'pending',
-              imageCount: _bugImages.length
+            // Cache everything for /fix and /repro-answer endpoints
+            cacheAnalysis(analyzeMatch[1], userId, {
+              result: result,
+              bugData: bugData,
+              bugImages: _bugImages,
+              agentError: agentError,
+              targetRoute: targetRoute,
+              templateCtx: _templateCtx,
+              parsedDesc: _parsedDesc,
+              extraDescription: extraDescription,
+              analyzeStart: _analyzeStart,
+              reproResult: reproResult || null,
+              reproPlan: reproPlan || null,
+              componentRegistry: _componentRegistry,
+              knownAutoIds: _knownAutoIds || []
             });
+
+            console.log('  Cached \u2014 waiting for /fix');
+            console.log('  Total:', ((Date.now() - _analyzeStart) / 1000).toFixed(1) + 's');
+            console.log('\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501');
+            console.log('');
+
+            var responseData = {
+              prompt: result.prompt,
+              analysis: result.analysis,
+              bug: bugData.bug,
+              agentError: agentError || null,
+              bugImages: _bugImages.length,
+              analysisCached: true,
+              reproduction: reproResult || null
+            };
+
+            // Include reproduction plan + questions + steps for UI
+            if (reproPlan) {
+              responseData.reproPlan = {
+                confidence: reproPlan.confidence,
+                plan: reproPlan.plan,
+                steps: reproPlan.steps,
+                questions: reproPlan.questions,
+                uncertainSelectors: reproPlan.uncertainSelectors,
+                formAnalysis: reproPlan.formAnalysis || null,
+                stepsCount: reproPlan.steps.length,
+                hasQuestions: reproPlan.questions.length > 0
+              };
+            }
+
+            sendJSON(res, 200, responseData);
+          }
+
+          // ================================================================
+          //  MAIN ANALYSIS PIPELINE
+          // ================================================================
+
+          if (!analyzeUser.agentUrl) {
+            // Local mode — just code scan, no reproduction
+            console.log('');
+            console.log('[STEP 3/4] \uD83D\uDD0E Scanning code LOCALLY in', analyzeUser.projectDir, '...');
+            var _scanStart2 = Date.now();
+            var localResult = fixPrompt.generatePrompt(userId, bugData, extraDescription, _parsedDesc);
+            console.log('[STEP 3/4] \u2705 Local scan complete in', (Date.now() - _scanStart2) + 'ms');
+            console.log('  Files:', (localResult.analysis ? localResult.analysis.relevantFiles.length : 0));
+            return respondWithAnalysis(localResult, null, null, null);
+          }
+
+          // Agent mode: full pipeline
+          //   1. Fetch contexts (template + component registry) in parallel
+          //   2. AI generates reproduction plan (with 4-layer prompt)
+          //   3. If confident: auto-run reproduction
+          //   4. Code scan
+          //   5. Cache & respond
+
+          console.log('');
+          console.log('[STEP 3a] \uD83D\uDD0E Fetching template context + component registry...');
+          var _contextsReady = 0;
+          var _knownAutoIds = [];
+
+          function onContextReady() {
+            _contextsReady++;
+            if (_contextsReady < 2) return;
+
+            console.log('[STEP 3a] \u2705 Contexts: template=' + (_templateCtx ? 'yes' : 'no') +
+              ', registry=' + _componentRegistry.length + ' components');
+
+            // No target route → skip reproduction
+            if (!targetRoute) {
+              console.log('[STEP 3b] \u26a0\ufe0f No target route \u2014 skipping reproduction');
+              return doCodeScan(null, null);
+            }
+
+            // Build reproduction plan via AI (all 4 layers)
+            console.log('[STEP 3b] \uD83E\uDDE0 Generating reproduction plan via AI...');
+            var stepsPromptResult = buildInteractionStepsPrompt(
+              bugData.bug.title || '',
+              bugData.bug.description || '',
+              _templateCtx || {},
+              _componentRegistry
+            );
+            var stepsPrompt = stepsPromptResult.prompt;
+            _knownAutoIds = stepsPromptResult.knownAutoIds;
+            console.log('[STEP 3b] Prompt:', stepsPrompt.length, 'chars, known data-auto-ids:', _knownAutoIds.length);
+
+            var copilotBridge = require('./lib/copilot-bridge-client');
             copilotBridge.checkHealth(function (hErr, hData) {
               if (!hErr && hData && hData.ok) {
-                console.log('[STEP 5/6] ✅ Copilot Bridge available — sending to model:', aiModel);
-                logger.info('AI_PROMPT', 'Using Copilot Bridge', { bugId: analyzeMatch[1], model: aiModel, provider: 'copilot-bridge' });
-                if (_bugImages.length > 0) console.log('  Including', _bugImages.length, 'bug screenshot(s) for vision analysis');
-                copilotBridge.analyze(result.prompt, aiModel, { images: _bugImages }, function (bErr, bResult) {
-                  if (!bErr) return sendFinalResponse(bResult, reproResult);
-                  console.log('[STEP 5/6] ⚠️ Copilot Bridge failed:', bErr.message, '— trying fallback...');
-                  tryFallback(reproResult);
+                copilotBridge.analyze(stepsPrompt, aiModel, function (bErr, bResult) {
+                  if (!bErr && bResult && bResult.text) {
+                    var plan = parseReproductionPlan(bResult.text);
+                    plan.steps = validateStepSelectors(plan.steps, _knownAutoIds);
+                    console.log('[STEP 3b] \u2705 Plan: confidence=' + plan.confidence +
+                      ', steps=' + plan.steps.length + ', questions=' + plan.questions.length);
+                    plan.steps.forEach(function (s, i) {
+                      console.log('[STEP 3b]   ' + (i + 1) + ': ' + s.action + ' ' + (s.selector || '') + ' \u2014 ' + (s.description || ''));
+                    });
+                    return handleReproPlan(plan);
+                  }
+                  console.log('[STEP 3b] \u26a0\ufe0f Copilot Bridge failed:', bErr ? bErr.message : 'empty \u2014 fallback');
+                  tryStepsFallback(stepsPrompt, function (fbPlan) {
+                    if (fbPlan) fbPlan.steps = validateStepSelectors(fbPlan.steps, _knownAutoIds);
+                    handleReproPlan(fbPlan);
+                  });
                 });
               } else {
-                console.log('[STEP 5/6] Copilot Bridge not available —', hErr ? hErr.message : 'trying fallback...');
-                tryFallback(reproResult);
+                tryStepsFallback(stepsPrompt, function (fbPlan) {
+                  if (fbPlan) fbPlan.steps = validateStepSelectors(fbPlan.steps, _knownAutoIds);
+                  handleReproPlan(fbPlan);
+                });
               }
             });
-
-            // Step 2–3: Fallback based on model type
-            function tryFallback(reproRes) {
-              if (isClaude) {
-                // Claude → Anthropic Direct API (needs Anthropic key)
-                if (claudeKey) {
-                  console.log('[STEP 5/6] 📡 Using Anthropic Direct API — model:', aiModel);
-                  console.log('  Waiting for Claude response (may take 30-120s)...');
-                  claudeClient.analyze(claudeKey, result.prompt, { model: aiModel, images: _bugImages }, function (clErr, clResult) {
-                    if (!clErr) return sendFinalResponse(clResult, reproRes);
-                    sendError('Anthropic API: ' + clErr.message, reproRes);
-                  });
-                } else {
-                  sendError('Claude model selected but no way to reach it.\n\n' +
-                    '• Install the Copilot Bridge VS Code extension (uses your Copilot license — no API key needed)\n' +
-                    '• Or add an Anthropic API key in Settings → AI Analysis', reproRes);
-                }
-              } else {
-                // Non-Claude → GitHub Models API (needs PAT)
-                if (githubToken) {
-                  console.log('[STEP 5/6] 📡 Using GitHub Models API — model:', aiModel);
-                  console.log('  Waiting for AI response (may take 30-120s)...');
-                  githubAI.analyze(githubToken, result.prompt, { model: aiModel, images: _bugImages }, function (ghErr, ghResult) {
-                    if (!ghErr) return sendFinalResponse(ghResult, reproRes);
-                    sendError('GitHub Models API: ' + ghErr.message, reproRes);
-                  });
-                } else {
-                  sendError('No GitHub token configured. Add your PAT in Settings → AI Analysis.', reproRes);
-                }
-              }
-            }
-
-            }); // end attemptReproduction
           }
 
-          if (analyzeUser.agentUrl) {
-            // Agent mode: proxy analysis through agent
-            // First, fetch template context for the target route (Layer 2)
-            // so the fix prompt includes the actual page files
+          function handleReproPlan(reproPlan) {
+            if (!reproPlan || reproPlan.steps.length === 0) {
+              console.log('[STEP 3c] \u26a0\ufe0f No reproduction steps \u2014 skipping to code scan');
+              return doCodeScan(null, reproPlan);
+            }
+
+            // ALWAYS show the plan to user for review — never auto-run
+            // User will click "Answer & Reproduce" or "Skip & Run" to trigger reproduction
+            console.log('[STEP 3c] \uD83D\uDCCB Returning plan to user for review (confidence: ' + reproPlan.confidence + ')');
+            console.log('[STEP 3c]   Steps: ' + reproPlan.steps.length + ', Questions: ' + reproPlan.questions.length);
+            if (reproPlan.questions.length > 0) {
+              reproPlan.questions.forEach(function (q) {
+                console.log('[STEP 3c]   Q: ' + q.question + ' (reason: ' + (q.reason || 'n/a') + ')');
+              });
+            }
+            doCodeScan(null, reproPlan);
+          }
+
+          function doCodeScan(reproResult, reproPlan) {
             console.log('');
-            var _templateCtx = null;
-            function fetchTemplateContextThenScan() {
-              if (targetRoute && analyzeUser.agentUrl) {
-                console.log('[STEP 3/6] 🎯 Fetching page template context for route:', targetRoute);
-                agentProxy.getTemplateContext(analyzeUser.agentUrl, targetRoute).then(function (tCtx) {
-                  if (tCtx && tCtx.hasTemplate) {
-                    _templateCtx = tCtx;
-                    console.log('[STEP 3/6] ✅ Template context:',
-                      tCtx.totalTemplates, 'templates,',
-                      (tCtx.routeJS || []).length, 'JS files,',
-                      (tCtx.componentTemplates || []).length, 'components');
-                  } else {
-                    console.log('[STEP 3/6] ⚠️ No template found for route — using keyword scan only');
-                  }
-                  doAgentScan();
-                }).catch(function (tErr) {
-                  console.log('[STEP 3/6] ⚠️ Template context fetch failed:', tErr.message, '— continuing with keyword scan');
-                  doAgentScan();
-                });
-              } else {
-                doAgentScan();
+            console.log('[STEP 4] \uD83D\uDD0E Scanning code via AGENT at', analyzeUser.agentUrl, '...');
+            var _scanStart = Date.now();
+            fixPrompt.generatePromptViaAgent(userId, bugData, analyzeUser.agentUrl, extraDescription, function (promptErr, result) {
+              if (promptErr) return send500(res, 'Agent error: ' + promptErr.message);
+              console.log('[STEP 4] \u2705 Agent scan complete in', (Date.now() - _scanStart) + 'ms');
+              console.log('  Files:', (result.analysis ? result.analysis.relevantFiles.length : 0));
+              respondWithAnalysis(result, result.agentError, reproResult || null, reproPlan || null);
+            }, _templateCtx, _parsedDesc);
+          }
+
+          // ── Kick off parallel context fetches ──
+          if (targetRoute) {
+            agentProxy.getTemplateContext(analyzeUser.agentUrl, targetRoute).then(function (tCtx) {
+              if (tCtx && tCtx.hasTemplate) {
+                _templateCtx = tCtx;
+                console.log('[STEP 3a] Template:', tCtx.totalTemplates, 'templates,',
+                  (tCtx.routeJS || []).length, 'JS,', (tCtx.componentTemplates || []).length, 'components');
               }
-            }
-
-            function doAgentScan() {
-              console.log('[STEP 3/6] 🔎 Scanning code via AGENT at', analyzeUser.agentUrl, '...');
-              var _scanStart = Date.now();
-              fixPrompt.generatePromptViaAgent(userId, bugData, analyzeUser.agentUrl, extraDescription, function (promptErr, result) {
-                if (promptErr) return send500(res, 'Agent error: ' + promptErr.message);
-                console.log('[STEP 3/6] ✅ Agent scan complete in', (Date.now() - _scanStart) + 'ms');
-                console.log('  Files found:', (result.analysis ? result.analysis.relevantFiles.length : 0), '| Agent error:', result.agentError || 'none');
-                respondWithAnalysis(result, result.agentError);
-              }, _templateCtx, _parsedDesc);
-            }
-
-            fetchTemplateContextThenScan();
+              onContextReady();
+            }).catch(function (e) {
+              console.log('[STEP 3a] \u26a0\ufe0f Template fetch failed:', e.message);
+              onContextReady();
+            });
           } else {
-            // Local mode
-            console.log('');
-            console.log('[STEP 3/6] 🔎 Scanning code LOCALLY in', analyzeUser.projectDir, '...');
-            var _scanStart2 = Date.now();
-            var result = fixPrompt.generatePrompt(userId, bugData, extraDescription, _parsedDesc);
-            console.log('[STEP 3/6] ✅ Local scan complete in', (Date.now() - _scanStart2) + 'ms');
-            console.log('  Files found:', (result.analysis ? result.analysis.relevantFiles.length : 0));
-            respondWithAnalysis(result, null);
+            onContextReady();
           }
-          } // end continueWithAnalysis
 
+          agentProxy.getComponentRegistry(analyzeUser.agentUrl).then(function (reg) {
+            if (reg && reg.components) {
+              _componentRegistry = reg.components;
+              console.log('[STEP 3a] Registry:', _componentRegistry.length, 'components');
+            }
+            onContextReady();
+          }).catch(function (e) {
+            console.log('[STEP 3a] \u26a0\ufe0f Registry fetch failed:', e.message);
+            onContextReady();
+          });
+
+          } // end continueWithAnalysis
           // Entry point: auto-detect route then continue
           autoDetectAndContinue();
           } // end proceedAfterImages
@@ -1669,6 +1826,569 @@ function handleRequest(req, res) {
             if (!includeImages) console.log('[STEP 2/6] \uD83D\uDDBC\uFE0F Screenshots excluded by user');
             proceedAfterImages();
           }
+        });
+      });
+      return;
+    }
+
+    // POST /api/bugs/:id/fix — send cached analysis + user instructions to AI
+    var fixMatch = pathname.match(/^\/api\/bugs\/([a-zA-Z0-9_]+)\/fix$/);
+    if (fixMatch && method === 'POST') {
+      var githubAI_fix = require('./lib/github-ai-client');
+      var claudeClient_fix = require('./lib/claude-client');
+      var copilotBridge_fix = require('./lib/copilot-bridge-client');
+
+      readBody(req, function (bodyErr, body) {
+        var bugId = fixMatch[1];
+        var userInstructions = (body && body.instructions) ? body.instructions : [];
+        var cached = getCachedAnalysis(bugId, userId);
+
+        if (!cached) {
+          return send400(res, 'No cached analysis found for this bug. Run Analyze first.');
+        }
+
+        var fixUser = userStore.getUser(userId);
+        var aiModel = fixUser.aiModel || 'claude-opus-4-6';
+        var isClaude = githubAI_fix.isClaudeModel(aiModel);
+        var githubToken = fixUser.githubToken || '';
+        var claudeKey = fixUser.claudeApiKey || '';
+        var prompt = cached.data.result.prompt;
+        var bugImages = cached.data.bugImages || [];
+        var _fixStart = Date.now();
+
+        console.log('');
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log('[FIX] 🤖 Fix request received');
+        console.log('  Bug ID:', bugId);
+        console.log('  User instructions:', userInstructions.length);
+        console.log('  AI model:', aiModel);
+        console.log('  Prompt length:', prompt.length, 'chars');
+        console.log('  Bug images:', bugImages.length);
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+        // Append user instructions to the prompt
+        if (userInstructions.length > 0) {
+          var instrSection = '\n\n## Additional Developer Instructions\n';
+          instrSection += 'The developer reviewing this analysis has provided the following guidance:\n\n';
+          for (var ii = 0; ii < userInstructions.length; ii++) {
+            instrSection += (ii + 1) + '. ' + userInstructions[ii] + '\n';
+          }
+          instrSection += '\nIMPORTANT: Follow these instructions carefully. They override any conflicting assumptions.\n';
+
+          // Insert before "## What You Must Do" if present
+          var taskMarkerFix = '## What You Must Do';
+          var markerIdxFix = prompt.indexOf(taskMarkerFix);
+          if (markerIdxFix > 0) {
+            prompt = prompt.substring(0, markerIdxFix) + instrSection + '\n' + prompt.substring(markerIdxFix);
+          } else {
+            prompt += instrSection;
+          }
+          console.log('[FIX] 📝 Appended', userInstructions.length, 'user instructions to prompt');
+          console.log('  Updated prompt length:', prompt.length, 'chars');
+        }
+
+        logger.aiPromptSent(bugId, prompt, {
+          model: aiModel,
+          provider: 'pending',
+          imageCount: bugImages.length,
+          userInstructions: userInstructions.length
+        });
+
+        function sendFixResponse(aiResult) {
+          console.log('');
+          console.log('[FIX] ✅ AI response received!');
+          console.log('  Model:', aiResult.model);
+          console.log('  Response length:', aiResult.text.length, 'chars');
+          console.log('  Usage:', JSON.stringify(aiResult.usage || {}));
+          console.log('  Total time:', ((Date.now() - _fixStart) / 1000).toFixed(1) + 's');
+          console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+          logger.aiResponseReceived(bugId, aiResult, Date.now() - _fixStart, {
+            provider: aiResult._provider || 'unknown'
+          });
+
+          // Save prompt log to agent if available
+          if (fixUser.agentUrl) {
+            agentProxy.promptSave(fixUser.agentUrl, {
+              bugId: bugId,
+              bugTitle: cached.data.bugData.bug.title || '',
+              bugStatus: cached.data.bugData.bug.status || '',
+              prompt: prompt,
+              aiModel: aiResult.model,
+              userInstructions: userInstructions,
+              timestamp: new Date().toISOString()
+            }).catch(function (e) {
+              console.log('[FIX] Prompt log save failed:', e.message);
+            });
+          }
+
+          sendJSON(res, 200, {
+            prompt: prompt,
+            analysis: cached.data.result.analysis,
+            bug: cached.data.bugData.bug,
+            agentError: cached.data.agentError || null,
+            bugImages: bugImages.length,
+            aiFix: {
+              text: aiResult.text,
+              model: aiResult.model,
+              usage: aiResult.usage
+            }
+          });
+        }
+
+        function sendFixError(errMsg) {
+          console.error('[FIX] ❌ AI ERROR:', errMsg);
+          logger.aiError(bugId, errMsg, { model: aiModel });
+          sendJSON(res, 200, {
+            prompt: prompt,
+            analysis: cached.data.result.analysis,
+            bug: cached.data.bugData.bug,
+            agentError: cached.data.agentError || null,
+            bugImages: bugImages.length,
+            aiFix: null,
+            aiError: errMsg
+          });
+        }
+
+        // Route to AI provider
+        console.log('[FIX] 🤖 Sending prompt to AI...');
+        copilotBridge_fix.checkHealth(function (hErr, hData) {
+          if (!hErr && hData && hData.ok) {
+            console.log('[FIX] ✅ Copilot Bridge available — sending to model:', aiModel);
+            copilotBridge_fix.analyze(prompt, aiModel, { images: bugImages }, function (bErr, bResult) {
+              if (!bErr) return sendFixResponse(bResult);
+              console.log('[FIX] ⚠️ Copilot Bridge failed:', bErr.message, '— trying fallback...');
+              tryFixFallback();
+            });
+          } else {
+            console.log('[FIX] Copilot Bridge not available — trying fallback...');
+            tryFixFallback();
+          }
+        });
+
+        function tryFixFallback() {
+          if (isClaude) {
+            if (claudeKey) {
+              console.log('[FIX] 📡 Using Anthropic Direct API — model:', aiModel);
+              claudeClient_fix.analyze(claudeKey, prompt, { model: aiModel, images: bugImages }, function (clErr, clResult) {
+                if (!clErr) return sendFixResponse(clResult);
+                sendFixError('Anthropic API: ' + clErr.message);
+              });
+            } else {
+              sendFixError('Claude model selected but no way to reach it.\n\n' +
+                '• Install the Copilot Bridge VS Code extension\n' +
+                '• Or add an Anthropic API key in Settings → AI Analysis');
+            }
+          } else {
+            if (githubToken) {
+              console.log('[FIX] 📡 Using GitHub Models API — model:', aiModel);
+              githubAI_fix.analyze(githubToken, prompt, { model: aiModel, images: bugImages }, function (ghErr, ghResult) {
+                if (!ghErr) return sendFixResponse(ghResult);
+                sendFixError('GitHub Models API: ' + ghErr.message);
+              });
+            } else {
+              sendFixError('No GitHub token configured. Add your PAT in Settings → AI Analysis.');
+            }
+          }
+        }
+      });
+      return;
+    }
+
+    // POST /api/bugs/:id/repro-answer — user answers AI questions → AI returns refined steps for REVIEW (no auto-run)
+    var reproAnswerMatch = pathname.match(/^\/api\/bugs\/([a-zA-Z0-9_]+)\/repro-answer$/);
+    if (reproAnswerMatch && method === 'POST') {
+      var githubAI_ra = require('./lib/github-ai-client');
+      var claudeClient_ra = require('./lib/claude-client');
+
+      readBody(req, function (bodyErr, body) {
+        var bugId_ra = reproAnswerMatch[1];
+        var userAnswers = (body && body.answers) ? body.answers : [];
+        var skipQuestions = body && body.skip === true;
+        var cached_ra = getCachedAnalysis(bugId_ra, userId);
+
+        if (!cached_ra) {
+          return send400(res, 'No cached analysis. Run Analyze first.');
+        }
+
+        var raUser = userStore.getUser(userId);
+        var reproPlan_ra = cached_ra.reproPlan;
+        if (!reproPlan_ra || !reproPlan_ra.steps || reproPlan_ra.steps.length === 0) {
+          return send400(res, 'No reproduction plan cached. Run Analyze first.');
+        }
+
+        var aiModel_ra = raUser.aiModel || 'claude-opus-4-6';
+        var _raStart = Date.now();
+
+        console.log('');
+        console.log('\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501');
+        console.log('[REPRO-ANSWER] Bug:', bugId_ra);
+        console.log('  Answers:', userAnswers.length, '| Skip:', skipQuestions);
+        console.log('\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501');
+
+        if (skipQuestions || userAnswers.length === 0) {
+          // Skip → return existing best-guess steps for review
+          console.log('[REPRO-ANSWER] Returning original steps for review (' + reproPlan_ra.steps.length + ')');
+          // Store in cache for /repro-run
+          cached_ra.approvedSteps = reproPlan_ra.steps;
+          sendJSON(res, 200, {
+            phase: 'review',
+            steps: reproPlan_ra.steps,
+            formAnalysis: reproPlan_ra.formAnalysis || null,
+            message: 'Review the steps below. Edit any step, then click Run Reproduction.'
+          });
+        } else {
+          // Build a refinement prompt with user answers
+          console.log('[REPRO-ANSWER] Refining steps with', userAnswers.length, 'answers...');
+          var refineLines = [];
+          refineLines.push('You previously generated a reproduction plan for a bug and had questions.');
+          refineLines.push('The user has now answered your questions. Generate REFINED Puppeteer interaction steps.');
+          refineLines.push('');
+          refineLines.push('## Original Plan');
+          refineLines.push('Steps: ' + reproPlan_ra.steps.length);
+          refineLines.push('```json');
+          refineLines.push(JSON.stringify(reproPlan_ra.steps, null, 2));
+          refineLines.push('```');
+          refineLines.push('');
+          if (reproPlan_ra.formAnalysis) {
+            refineLines.push('## Form Analysis');
+            refineLines.push('```json');
+            refineLines.push(JSON.stringify(reproPlan_ra.formAnalysis, null, 2));
+            refineLines.push('```');
+            refineLines.push('');
+          }
+          refineLines.push('## Your Questions & User Answers');
+          userAnswers.forEach(function (qa) {
+            refineLines.push('**Q: ' + (qa.question || qa.id) + '**');
+            refineLines.push('A: ' + (qa.answer || '(no answer)'));
+            refineLines.push('');
+          });
+          refineLines.push('## Task');
+          refineLines.push('Using the user answers, generate CORRECTED interaction steps.');
+          refineLines.push('Fix selectors, add missing steps, adjust form values, or modify the flow based on the answers.');
+          refineLines.push('');
+          refineLines.push('If the user confirmed a selector → keep it.');
+          refineLines.push('If the user provided a new selector or value → use it.');
+          refineLines.push('If the user said a field is mandatory → ensure a type step fills it.');
+          refineLines.push('');
+          refineLines.push('IMPORTANT: Every step with a selector MUST include:');
+          refineLines.push('- "fallbackSelectors": array of 2-4 alternative CSS selectors');
+          refineLines.push('- "textContent": the visible text of the target element (for text-based finding)');
+          refineLines.push('');
+          // Include data-auto-id allowlist if available
+          var raAutoIds = cached_ra.knownAutoIds || [];
+          if (raAutoIds.length > 0) {
+            refineLines.push('## STRICT data-auto-id ALLOWLIST');
+            refineLines.push('ONLY these data-auto-id values exist in the codebase. NEVER invent new ones:');
+            refineLines.push(raAutoIds.map(function (id) { return '  - `[data-auto-id="' + id + '"]`'; }).join('\n'));
+            refineLines.push('');
+            refineLines.push('If an element is NOT in this list, it does NOT have a data-auto-id. Use CSS class selectors instead.');
+            refineLines.push('');
+          }
+          refineLines.push('Return ONLY a valid JSON array of steps. No markdown fences.');
+          var refinePrompt = refineLines.join('\n');
+
+          var copilotBridge_ra = require('./lib/copilot-bridge-client');
+          copilotBridge_ra.checkHealth(function (hErr, hData) {
+            function parseStepsArray(text) {
+              if (!text) return [];
+              var c = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '');
+              try {
+                var m = c.match(/\[[\s\S]*\]/);
+                if (m) {
+                  var arr = JSON.parse(m[0]);
+                  if (Array.isArray(arr)) return arr.filter(function (s) { return s && s.action; });
+                }
+              } catch (e) { /* ignore */ }
+              return [];
+            }
+
+            function gotRefinedSteps(steps) {
+              var finalSteps = (steps && steps.length > 0) ? steps : reproPlan_ra.steps;
+              // Validate data-auto-ids against known allowlist
+              var cachedAutoIds = cached_ra.knownAutoIds || [];
+              if (cachedAutoIds.length > 0) {
+                finalSteps = validateStepSelectors(finalSteps, cachedAutoIds);
+              }
+              console.log('[REPRO-ANSWER] \u2705 Returning', finalSteps.length, 'refined steps for review');
+              // Store refined steps in cache for /repro-run
+              cached_ra.approvedSteps = finalSteps;
+              // Also update the reproPlan in cache
+              cached_ra.reproPlan.steps = finalSteps;
+              sendJSON(res, 200, {
+                phase: 'review',
+                steps: finalSteps,
+                formAnalysis: reproPlan_ra.formAnalysis || null,
+                refined: steps && steps.length > 0,
+                message: 'AI refined the steps based on your answers. Review and edit, then click Run Reproduction.'
+              });
+              console.log('[REPRO-ANSWER] Done in', ((Date.now() - _raStart) / 1000).toFixed(1) + 's');
+            }
+
+            function tryRefineFallback() {
+              var isCl = githubAI_ra.isClaudeModel(aiModel_ra);
+              if (isCl && raUser.claudeApiKey) {
+                claudeClient_ra.analyze(raUser.claudeApiKey, refinePrompt, { model: aiModel_ra }, function (e, r) {
+                  gotRefinedSteps((!e && r && r.text) ? parseStepsArray(r.text) : []);
+                });
+              } else if (!isCl && raUser.githubToken) {
+                githubAI_ra.analyze(raUser.githubToken, refinePrompt, { model: aiModel_ra }, function (e, r) {
+                  gotRefinedSteps((!e && r && r.text) ? parseStepsArray(r.text) : []);
+                });
+              } else {
+                gotRefinedSteps([]);
+              }
+            }
+
+            if (!hErr && hData && hData.ok) {
+              copilotBridge_ra.analyze(refinePrompt, aiModel_ra, function (bErr, bRes) {
+                if (!bErr && bRes && bRes.text) {
+                  return gotRefinedSteps(parseStepsArray(bRes.text));
+                }
+                tryRefineFallback();
+              });
+            } else {
+              tryRefineFallback();
+            }
+          });
+        }
+      });
+      return;
+    }
+
+    // POST /api/bugs/:id/repro-refine — user provides feedback on steps, AI adjusts
+    var reproRefineMatch = pathname.match(/^\/api\/bugs\/([a-zA-Z0-9_]+)\/repro-refine$/);
+    if (reproRefineMatch && method === 'POST') {
+      var githubAI_rf = require('./lib/github-ai-client');
+      var claudeClient_rf = require('./lib/claude-client');
+
+      readBody(req, function (bodyErr, body) {
+        var bugId_rf = reproRefineMatch[1];
+        var currentSteps = (body && body.steps) ? body.steps : [];
+        var userFeedback = (body && body.feedback) ? body.feedback : '';
+        var cached_rf = getCachedAnalysis(bugId_rf, userId);
+
+        if (!cached_rf) {
+          return send400(res, 'No cached analysis. Run Analyze first.');
+        }
+
+        var rfUser = userStore.getUser(userId);
+        var aiModel_rf = rfUser.aiModel || 'claude-opus-4-6';
+        var _rfStart = Date.now();
+
+        console.log('');
+        console.log('[REPRO-REFINE] Bug:', bugId_rf);
+        console.log('  Current steps:', currentSteps.length, '| Feedback:', userFeedback.length, 'chars');
+
+        var rfLines = [];
+        rfLines.push('You are refining Puppeteer reproduction steps for a bug based on user feedback.');
+        rfLines.push('');
+        rfLines.push('## Bug');
+        rfLines.push('Title: ' + ((cached_rf.bugData && cached_rf.bugData.bug) ? cached_rf.bugData.bug.title : 'Unknown'));
+        rfLines.push('');
+        rfLines.push('## Current Steps');
+        rfLines.push('```json');
+        rfLines.push(JSON.stringify(currentSteps, null, 2));
+        rfLines.push('```');
+        rfLines.push('');
+        rfLines.push('## User Feedback');
+        rfLines.push(userFeedback);
+        rfLines.push('');
+        rfLines.push('## Task');
+        rfLines.push('Adjust the steps based on the user feedback.');
+        rfLines.push('The user may want to: change selectors, add steps, remove steps, change values, reorder steps, etc.');
+        rfLines.push('Apply the feedback and return the COMPLETE CORRECTED steps array.');
+        rfLines.push('');
+        rfLines.push('IMPORTANT: Every step with a selector MUST include:');
+        rfLines.push('- "fallbackSelectors": array of 2-4 alternative CSS selectors');
+        rfLines.push('- "textContent": the visible text of the target element (for text-based finding)');
+        rfLines.push('');
+        // Include data-auto-id allowlist if available
+        var rfAutoIds = cached_rf.knownAutoIds || [];
+        if (rfAutoIds.length > 0) {
+          rfLines.push('## STRICT data-auto-id ALLOWLIST');
+          rfLines.push('ONLY these data-auto-id values exist in the codebase. NEVER invent new ones:');
+          rfLines.push(rfAutoIds.map(function (id) { return '  - `[data-auto-id="' + id + '"]`'; }).join('\n'));
+          rfLines.push('');
+          rfLines.push('If an element is NOT in this list, it does NOT have a data-auto-id. Use CSS class selectors instead.');
+          rfLines.push('');
+        }
+        rfLines.push('Return ONLY a valid JSON array of steps. No markdown fences, no explanation.');
+        var rfPrompt = rfLines.join('\n');
+
+        var copilotBridge_rf = require('./lib/copilot-bridge-client');
+        copilotBridge_rf.checkHealth(function (hErr, hData) {
+          function parseRfSteps(text) {
+            if (!text) return [];
+            var c = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '');
+            try {
+              var m = c.match(/\[[\s\S]*\]/);
+              if (m) {
+                var arr = JSON.parse(m[0]);
+                if (Array.isArray(arr)) return arr.filter(function (s) { return s && s.action; });
+              }
+            } catch (e) { /* ignore */ }
+            return [];
+          }
+
+          function gotRfSteps(steps) {
+            var finalSteps = (steps && steps.length > 0) ? steps : currentSteps;
+            // Validate data-auto-ids against known allowlist
+            var rfCachedAutoIds = cached_rf.knownAutoIds || [];
+            if (rfCachedAutoIds.length > 0) {
+              finalSteps = validateStepSelectors(finalSteps, rfCachedAutoIds);
+            }
+            console.log('[REPRO-REFINE] \u2705 Returning', finalSteps.length, 'refined steps');
+            cached_rf.approvedSteps = finalSteps;
+            if (cached_rf.reproPlan) cached_rf.reproPlan.steps = finalSteps;
+            sendJSON(res, 200, {
+              phase: 'review',
+              steps: finalSteps,
+              refined: steps && steps.length > 0,
+              message: 'Steps updated based on your feedback. Review and run when ready.'
+            });
+            console.log('[REPRO-REFINE] Done in', ((Date.now() - _rfStart) / 1000).toFixed(1) + 's');
+          }
+
+          function tryRfFallback() {
+            var isCl = githubAI_rf.isClaudeModel(aiModel_rf);
+            if (isCl && rfUser.claudeApiKey) {
+              claudeClient_rf.analyze(rfUser.claudeApiKey, rfPrompt, { model: aiModel_rf }, function (e, r) {
+                gotRfSteps((!e && r && r.text) ? parseRfSteps(r.text) : []);
+              });
+            } else if (!isCl && rfUser.githubToken) {
+              githubAI_rf.analyze(rfUser.githubToken, rfPrompt, { model: aiModel_rf }, function (e, r) {
+                gotRfSteps((!e && r && r.text) ? parseRfSteps(r.text) : []);
+              });
+            } else {
+              gotRfSteps([]);
+            }
+          }
+
+          if (!hErr && hData && hData.ok) {
+            copilotBridge_rf.analyze(rfPrompt, aiModel_rf, function (bErr, bRes) {
+              if (!bErr && bRes && bRes.text) {
+                return gotRfSteps(parseRfSteps(bRes.text));
+              }
+              tryRfFallback();
+            });
+          } else {
+            tryRfFallback();
+          }
+        });
+      });
+      return;
+    }
+
+    // POST /api/bugs/:id/repro-run — user approved steps, now execute Puppeteer reproduction
+    var reproRunMatch = pathname.match(/^\/api\/bugs\/([a-zA-Z0-9_]+)\/repro-run$/);
+    if (reproRunMatch && method === 'POST') {
+      readBody(req, function (bodyErr, body) {
+        var bugId_run = reproRunMatch[1];
+        var stepsToRun = (body && body.steps) ? body.steps : [];
+        var cached_run = getCachedAnalysis(bugId_run, userId);
+
+        if (!cached_run) {
+          return send400(res, 'No cached analysis. Run Analyze first.');
+        }
+
+        var runUser = userStore.getUser(userId);
+        if (!runUser.agentUrl) {
+          return send400(res, 'Agent URL not configured — reproduction requires a running agent.');
+        }
+
+        // Use provided steps or fall back to cached approved steps
+        var steps = (stepsToRun.length > 0) ? stepsToRun : (cached_run.approvedSteps || (cached_run.reproPlan ? cached_run.reproPlan.steps : []));
+        if (!steps || steps.length === 0) {
+          return send400(res, 'No reproduction steps to run.');
+        }
+
+        var devServerUrl_run = runUser.devServerUrl || '';
+        var targetRoute_run = cached_run.targetRoute || '';
+        var bugTitle_run = (cached_run.bugData && cached_run.bugData.bug) ? cached_run.bugData.bug.title || '' : '';
+        var bugDesc_run = (cached_run.bugData && cached_run.bugData.bug) ? cached_run.bugData.bug.description || '' : '';
+        var _runStart = Date.now();
+
+        console.log('');
+        console.log('\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501');
+        console.log('[REPRO-RUN] Bug:', bugId_run);
+        console.log('  Steps:', steps.length, '| User approved');
+        console.log('\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501');
+
+        agentProxy.playwrightGenerate(
+          runUser.agentUrl, bugId_run,
+          bugTitle_run, bugDesc_run,
+          devServerUrl_run,
+          runUser.testUsername || '', runUser.testPassword || '',
+          targetRoute_run, steps
+        ).then(function (genResult) {
+          console.log('[REPRO-RUN] \u2705 Script generated:', genResult.testFile);
+          console.log('[REPRO-RUN] \uD83C\uDFC3 Running...');
+          agentProxy.playwrightRun(runUser.agentUrl, genResult.testFile).then(function (runResult) {
+            var bugConfirmed = !!runResult.bugConfirmed;
+            var assertions = runResult.assertions || [];
+            var navigationOk = runResult.navigationOk !== false;
+            var reproduced = bugConfirmed || !runResult.passed;
+            var status = 'not-reproduced';
+            if (bugConfirmed) status = 'bug-confirmed';
+            else if (!navigationOk) { status = 'navigation-failed'; reproduced = false; }
+            else if (!runResult.passed) status = 'test-errors';
+            else if (assertions.length > 0) status = 'assertions-passed';
+            else status = 'no-assertions';
+
+            var reproResult = {
+              attempted: true, passed: runResult.passed, reproduced: reproduced,
+              bugConfirmed: bugConfirmed, assertions: assertions, navigationOk: navigationOk,
+              pageUrl: runResult.pageUrl || null, status: status, output: runResult.output,
+              duration: runResult.duration, testFile: genResult.testFile,
+              screenshotFile: runResult.screenshotFile, interactionSteps: steps.length,
+              stepResults: runResult.stepResults || [],
+              domSnapshot: runResult.domSnapshot || null
+            };
+
+            console.log('[REPRO-RUN] Result: status=' + status + ', ' + (runResult.duration || 0) + 'ms');
+
+            // Update cache
+            cached_run.reproResult = reproResult;
+
+            // Inject reproduction evidence into prompt
+            if (reproResult.attempted && cached_run.result && cached_run.result.prompt) {
+              var evidenceLines = [];
+              evidenceLines.push('## \uD83E\uDDEA Reproduction Evidence (Automated Browser Test)');
+              evidenceLines.push('');
+              evidenceLines.push('**Status:** ' + reproResult.status);
+              if (reproResult.bugConfirmed) evidenceLines.push('\u26a0\ufe0f **BUG CONFIRMED**');
+              if (reproResult.pageUrl) evidenceLines.push('**Final URL:** `' + reproResult.pageUrl + '`');
+              evidenceLines.push('**Duration:** ' + (reproResult.duration || 0) + 'ms');
+              if (reproResult.assertions && reproResult.assertions.length > 0) {
+                evidenceLines.push('');
+                evidenceLines.push('### Assertions');
+                reproResult.assertions.forEach(function (a, i) {
+                  var st = a.passed ? '\u2705' : '\u274c';
+                  if (a.status === 'element-not-found') st = '\u26a0\ufe0f';
+                  evidenceLines.push((i + 1) + '. ' + st + ' ' + (a.description || 'assertion'));
+                  if (a.selector) evidenceLines.push('   - Selector: `' + a.selector + '`');
+                  if (a.expected !== undefined) evidenceLines.push('   - Expected (buggy): `' + a.expected + '`');
+                  if (a.actual !== undefined) evidenceLines.push('   - Actual: `' + a.actual + '`');
+                });
+              }
+              var evidence = evidenceLines.join('\n');
+              var prompt = cached_run.result.prompt;
+              var tm = '## What You Must Do';
+              var mi = prompt.indexOf(tm);
+              if (mi > 0) {
+                cached_run.result.prompt = prompt.substring(0, mi) + evidence + '\n' + prompt.substring(mi);
+              }
+            }
+
+            console.log('[REPRO-RUN] \u2705 Done in', ((Date.now() - _runStart) / 1000).toFixed(1) + 's');
+            sendJSON(res, 200, { reproduction: reproResult });
+          }).catch(function (runErr) {
+            console.log('[REPRO-RUN] \u26a0\ufe0f Run failed:', runErr.message);
+            sendJSON(res, 200, { reproduction: { attempted: true, passed: false, reproduced: false, error: runErr.message } });
+          });
+        }).catch(function (genErr) {
+          console.log('[REPRO-RUN] \u26a0\ufe0f Generate failed:', genErr.message);
+          sendJSON(res, 200, { reproduction: { attempted: false, error: genErr.message } });
         });
       });
       return;

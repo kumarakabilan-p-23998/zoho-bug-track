@@ -103,6 +103,12 @@
   var modalTitle        = $('#modal-title');
   var modalDetails      = $('#modal-details');
   var analyzeBtn        = $('#analyze-btn');
+  var fixBtn             = $('#fix-btn');
+  var instructionPanel   = $('#instruction-panel');
+  var instructionInput   = $('#instruction-input');
+  var instructionAddBtn  = $('#instruction-add-btn');
+  var instructionList    = $('#instruction-list');
+  var instructionCount   = $('#instruction-count');
   var analysisSection   = $('#analysis-section');
   var analysisPrompt    = $('#analysis-prompt');
   var copyPromptBtn     = $('#copy-prompt-btn');
@@ -160,9 +166,13 @@
   var diffFileCache     = {};
   var codeFileCache     = {};
   var editedFiles       = [];  // files edited/applied during this bug session
+  var currentReproSteps = [];  // full step objects with fallbackSelectors/textContent
 
   // Per-bug extra description cache
   var extraDescCache    = {};
+
+  // User instructions for AI fix
+  var userInstructions  = [];
 
   // Bugs list for split view
   var currentBugs       = [];
@@ -357,6 +367,13 @@
 
     // Bug detail split-view panel
     analyzeBtn.addEventListener('click', analyzeBug);
+    if (fixBtn) fixBtn.addEventListener('click', getFixForBug);
+    if (instructionAddBtn) instructionAddBtn.addEventListener('click', addInstruction);
+    if (instructionInput) {
+      instructionInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') addInstruction();
+      });
+    }
     if (autoDetectRouteBtn) autoDetectRouteBtn.addEventListener('click', autoDetectRoute);
     if (formatTemplateBtn) formatTemplateBtn.addEventListener('click', insertFormatTemplate);
     copyPromptBtn.addEventListener('click', copyPrompt);
@@ -572,13 +589,19 @@
     analysisSection.style.display = 'none';
     analysisPrompt.textContent = '';
     drawerFileTabs.innerHTML = '';
-    drawerCodeView.innerHTML = '<div class="code-viewer-empty">Click "Analyze & Fix" to scan your project and get fix suggestions.</div>';
+    drawerCodeView.innerHTML = '<div class="code-viewer-empty">Click "Analyze" to scan your project, then "Get Fix" for AI suggestions.</div>';
     codeFileCache = {};
     currentAnalysis = null;
     currentDiffPrompt = '';
     editedFiles = [];
     appliedDiffFiles = [];
     parsedDiffBlocks = [];
+    // Reset instruction state
+    userInstructions = [];
+    if (instructionPanel) instructionPanel.style.display = 'none';
+    if (instructionList) instructionList.innerHTML = '';
+    if (instructionCount) instructionCount.textContent = '0 instructions';
+    if (fixBtn) { fixBtn.disabled = true; }
     // Reset diff section
     analysisDiffSection.style.display = 'none';
     diffCommitError.style.display = 'none';
@@ -778,7 +801,9 @@
     if (!currentBugId) return;
 
     analyzeBtn.disabled = true;
-    analyzeBtn.innerHTML = '<span class="spinner"></span> Analyzing with AI\u2026';
+    analyzeBtn.innerHTML = '<span class="spinner"></span> Analyzing\u2026';
+    // Disable fix button during analysis
+    if (fixBtn) fixBtn.disabled = true;
 
     var extraDesc = document.getElementById('extra-desc-input').value.trim();
     extraDescCache[currentBugId] = extraDesc;
@@ -789,7 +814,7 @@
 
     apiPost('/api/bugs/' + currentBugId + '/analyze', body, function (status, data) {
       analyzeBtn.disabled = false;
-      analyzeBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/></svg> Analyze & Fix';
+      analyzeBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Analyze';
 
       if (status !== 200 || !data) {
         var errDetail = '';
@@ -823,11 +848,482 @@
       analysisSection.style.display = 'block';
       analysisPrompt.textContent = data.prompt || 'No prompt generated.';
 
-      // ── Build accordion-based analysis view ──
+      // ── Build accordion-based analysis view (without AI fix) ──
       buildAnalysisAccordions(data, currentAnalysis);
+
+      // Show instruction panel and enable fix button
+      if (instructionPanel) instructionPanel.style.display = 'block';
+      if (fixBtn) fixBtn.disabled = false;
 
       // Scroll analysis section into view
       analysisSection.scrollIntoView({ behavior: 'smooth' });
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════
+  //  GET FIX — sends cached analysis + instructions to AI
+  // ═══════════════════════════════════════════════════════
+
+  function getFixForBug() {
+    if (!currentBugId) return;
+
+    if (fixBtn) {
+      fixBtn.disabled = true;
+      fixBtn.innerHTML = '<span class="spinner"></span> Getting Fix\u2026';
+    }
+    analyzeBtn.disabled = true;
+
+    var body = { instructions: userInstructions };
+
+    apiPost('/api/bugs/' + currentBugId + '/fix', body, function (status, data) {
+      if (fixBtn) {
+        fixBtn.disabled = false;
+        fixBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg> Get Fix';
+      }
+      analyzeBtn.disabled = false;
+
+      if (status !== 200 || !data) {
+        var errDetail = '';
+        if (data && data.error) {
+          errDetail = data.error;
+        } else if (data && data.aiError) {
+          errDetail = data.aiError;
+        } else if (status === 0) {
+          errDetail = 'Network error — server may be unreachable.';
+        } else {
+          errDetail = 'Server returned status ' + status + '. Check server console for details.';
+        }
+        alert('Fix generation failed: ' + errDetail);
+        return;
+      }
+
+      // Update cached data
+      if (data.prompt) currentDiffPrompt = data.prompt;
+      if (data.analysis) currentAnalysis = data.analysis;
+
+      // Rebuild accordions with AI fix data
+      buildAnalysisAccordions(data, data.analysis || currentAnalysis);
+
+      analysisSection.scrollIntoView({ behavior: 'smooth' });
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════
+  //  INSTRUCTION MANAGEMENT — real-time user instructions
+  // ═══════════════════════════════════════════════════════
+
+  function addInstruction() {
+    if (!instructionInput) return;
+    var text = instructionInput.value.trim();
+    if (!text) return;
+
+    userInstructions.push(text);
+    instructionInput.value = '';
+    renderInstructions();
+    instructionInput.focus();
+  }
+
+  function removeInstruction(idx) {
+    userInstructions.splice(idx, 1);
+    renderInstructions();
+  }
+
+  function renderInstructions() {
+    if (!instructionList || !instructionCount) return;
+    instructionCount.textContent = userInstructions.length + ' instruction' + (userInstructions.length !== 1 ? 's' : '');
+
+    if (userInstructions.length === 0) {
+      instructionList.innerHTML = '<div class="instruction-empty">No instructions added yet. Add context to guide the AI fix.</div>';
+      return;
+    }
+
+    var html = '';
+    for (var i = 0; i < userInstructions.length; i++) {
+      html += '<div class="instruction-item">';
+      html += '<span class="instruction-num">' + (i + 1) + '.</span>';
+      html += '<span class="instruction-text">' + esc(userInstructions[i]) + '</span>';
+      html += '<button class="instruction-remove" data-idx="' + i + '" title="Remove">&times;</button>';
+      html += '</div>';
+    }
+    instructionList.innerHTML = html;
+
+    // Wire remove buttons
+    instructionList.querySelectorAll('.instruction-remove').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        removeInstruction(parseInt(btn.getAttribute('data-idx'), 10));
+      });
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════
+  //  REPRODUCTION PLAN — answer questions & run reproduction
+  // ═══════════════════════════════════════════════════════
+
+  function collectReproAnswers() {
+    var questionsList = document.getElementById('repro-questions-list');
+    if (!questionsList) return [];
+    var items = questionsList.querySelectorAll('.repro-question-item');
+    var answers = [];
+    items.forEach(function (item, idx) {
+      var qid = item.getAttribute('data-qid') || ('q' + idx);
+      var qText = item.querySelector('.repro-question-text');
+      var answer = '';
+
+      // Check radio buttons (options)
+      var radios = item.querySelectorAll('input[type="radio"]');
+      radios.forEach(function (r) {
+        if (r.checked) {
+          if (r.value === '__custom__') {
+            var customInput = item.querySelector('.repro-custom-input');
+            answer = customInput ? customInput.value.trim() : '';
+          } else {
+            answer = r.value;
+          }
+        }
+      });
+
+      // Check freetext input
+      if (!answer) {
+        var freeInput = item.querySelector('.repro-answer-input');
+        if (freeInput) answer = freeInput.value.trim();
+      }
+
+      if (answer) {
+        answers.push({
+          id: qid,
+          question: qText ? qText.textContent.replace(/^\d+\.\s*/, '') : '',
+          answer: answer
+        });
+      }
+    });
+    return answers;
+  }
+
+  // Build step cards HTML from steps array
+  function buildStepCards(steps) {
+    var html = '';
+    for (var si = 0; si < steps.length; si++) {
+      var s = steps[si];
+      var actionIcon = '\u2022';
+      if (s.action === 'click') actionIcon = '\uD83D\uDC46';
+      else if (s.action === 'type') actionIcon = '\u2328\ufe0f';
+      else if (s.action === 'waitForSelector' || s.action === 'wait') actionIcon = '\u23f3';
+      else if (s.action === 'assert') actionIcon = '\u2705';
+      else if (s.action === 'screenshot') actionIcon = '\uD83D\uDCF8';
+      else if (s.action === 'hover') actionIcon = '\uD83D\uDD0D';
+      else if (s.action === 'select') actionIcon = '\uD83D\uDD3D';
+
+      html += '<div class="repro-step-card" data-step-idx="' + si + '">';
+      html += '<div class="repro-step-header">';
+      html += '<span class="repro-step-num">' + (si + 1) + '</span>';
+      html += '<span class="repro-step-icon">' + actionIcon + '</span>';
+      html += '<span class="repro-step-action">' + esc(s.action) + '</span>';
+      if (s.selector) html += '<code class="repro-step-selector">' + esc(s.selector) + '</code>';
+      html += '<button class="repro-step-edit-toggle" data-idx="' + si + '" title="Edit step">\u270F\ufe0f</button>';
+      html += '<button class="repro-step-delete" data-idx="' + si + '" title="Remove step">\u274c</button>';
+      html += '</div>';
+      if (s.description) html += '<div class="repro-step-desc">' + esc(s.description) + '</div>';
+      // Detail chips
+      var chips = [];
+      if (s.text) chips.push('text: "' + s.text + '"');
+      if (s.value) chips.push('value: "' + s.value + '"');
+      if (s.ms) chips.push('wait: ' + s.ms + 'ms');
+      if (s.attribute) chips.push('attr: ' + s.attribute);
+      if (s.expected) chips.push('expected: "' + s.expected + '"');
+      if (s.compare) chips.push('compare: ' + s.compare);
+      if (s.name) chips.push('name: ' + s.name);
+      if (chips.length > 0) {
+        html += '<div class="repro-step-chips">';
+        for (var ci = 0; ci < chips.length; ci++) {
+          html += '<span class="repro-step-chip">' + esc(chips[ci]) + '</span>';
+        }
+        html += '</div>';
+      }
+      // Edit fields (hidden by default)
+      html += '<div class="repro-step-edit" id="repro-step-edit-' + si + '" style="display:none;">';
+      html += '<label>Action: <select class="repro-edit-field" data-field="action">';
+      var actions = ['click', 'type', 'waitForSelector', 'select', 'hover', 'wait', 'screenshot', 'assert'];
+      for (var ai = 0; ai < actions.length; ai++) {
+        html += '<option value="' + actions[ai] + '"' + (s.action === actions[ai] ? ' selected' : '') + '>' + actions[ai] + '</option>';
+      }
+      html += '</select></label>';
+      html += '<label>Selector: <input type="text" class="repro-edit-field" data-field="selector" value="' + esc(s.selector || '') + '"></label>';
+      html += '<label>Text/Value: <input type="text" class="repro-edit-field" data-field="text" value="' + esc(s.text || s.value || '') + '"></label>';
+      html += '<label>Description: <input type="text" class="repro-edit-field" data-field="description" value="' + esc(s.description || '') + '"></label>';
+      if (s.action === 'assert') {
+        html += '<label>Attribute: <input type="text" class="repro-edit-field" data-field="attribute" value="' + esc(s.attribute || '') + '"></label>';
+        html += '<label>Expected: <input type="text" class="repro-edit-field" data-field="expected" value="' + esc(s.expected || '') + '"></label>';
+      }
+      html += '<div class="repro-step-edit-actions">';
+      html += '<button class="btn btn-sm btn-primary repro-step-save" data-idx="' + si + '">Save</button>';
+      html += '<button class="btn btn-sm btn-outline repro-step-cancel" data-idx="' + si + '">Cancel</button>';
+      html += '</div>';
+      html += '</div>'; // end edit
+      html += '</div>'; // end step-card
+    }
+    return html;
+  }
+
+  // Collect current steps from step cards in the DOM
+  function collectStepsFromCards() {
+    var cards = document.querySelectorAll('.repro-step-card');
+    var steps = [];
+    cards.forEach(function (card, idx) {
+      var actionEl = card.querySelector('.repro-step-action');
+      var selectorEl = card.querySelector('.repro-step-selector');
+      var descEl = card.querySelector('.repro-step-desc');
+      var chipsEl = card.querySelectorAll('.repro-step-chip');
+
+      // Start with the stored full step (preserves fallbackSelectors, textContent, etc.)
+      var base = (currentReproSteps[idx] && typeof currentReproSteps[idx] === 'object') ? currentReproSteps[idx] : {};
+      var step = {};
+      // Copy all base properties (fallbackSelectors, textContent, etc.)
+      for (var key in base) {
+        if (base.hasOwnProperty(key)) step[key] = base[key];
+      }
+      // Override with what's visible on the card (user may have edited these)
+      step.action = actionEl ? actionEl.textContent.trim() : (step.action || 'click');
+      step.selector = selectorEl ? selectorEl.textContent.trim() : (step.selector || '');
+      step.description = descEl ? descEl.textContent.trim() : (step.description || '');
+
+      // Parse chips for additional properties (overrides base)
+      chipsEl.forEach(function (chip) {
+        var txt = chip.textContent;
+        var match;
+        if ((match = txt.match(/^text:\s*"(.+)"$/))) step.text = match[1];
+        else if ((match = txt.match(/^value:\s*"(.+)"$/))) step.value = match[1];
+        else if ((match = txt.match(/^wait:\s*(\d+)ms$/))) step.ms = parseInt(match[1], 10);
+        else if ((match = txt.match(/^attr:\s*(.+)$/))) step.attribute = match[1];
+        else if ((match = txt.match(/^expected:\s*"(.+)"$/))) step.expected = match[1];
+        else if ((match = txt.match(/^compare:\s*(.+)$/))) step.compare = match[1];
+        else if ((match = txt.match(/^name:\s*(.+)$/))) step.name = match[1];
+      });
+
+      steps.push(step);
+    });
+    return steps;
+  }
+
+  // Submit answers to AI → get refined steps for review (no auto-run)
+  function submitReproAnswers() {
+    if (!currentBugId) return;
+    var answers = collectReproAnswers();
+    if (answers.length === 0) {
+      alert('Please answer at least one question before submitting.');
+      return;
+    }
+
+    var btn = document.getElementById('repro-answer-submit-btn');
+    var skipBtn = document.getElementById('repro-skip-run-btn');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Generating steps\u2026'; }
+    if (skipBtn) skipBtn.disabled = true;
+
+    apiPost('/api/bugs/' + currentBugId + '/repro-answer', { answers: answers }, function (status, data) {
+      if (btn) { btn.disabled = false; btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg> Submit Answers & Generate Steps'; }
+      if (skipBtn) skipBtn.disabled = false;
+
+      if (status !== 200 || !data) {
+        alert('Failed: ' + ((data && data.error) || 'Unknown error'));
+        return;
+      }
+
+      // Phase transition: hide questions, show step review
+      if (data.phase === 'review' && data.steps) {
+        transitionToStepReview(data.steps, data.message);
+      }
+    });
+  }
+
+  // Skip questions → show existing steps for review (no auto-run)
+  function skipReproQuestions() {
+    if (!currentBugId) return;
+
+    var btn = document.getElementById('repro-skip-run-btn');
+    var ansBtn = document.getElementById('repro-answer-submit-btn');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Loading steps\u2026'; }
+    if (ansBtn) ansBtn.disabled = true;
+
+    apiPost('/api/bugs/' + currentBugId + '/repro-answer', { skip: true }, function (status, data) {
+      if (btn) { btn.disabled = false; btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Skip & Show Steps'; }
+      if (ansBtn) ansBtn.disabled = false;
+
+      if (status !== 200 || !data) {
+        alert('Failed: ' + ((data && data.error) || 'Unknown error'));
+        return;
+      }
+
+      if (data.phase === 'review' && data.steps) {
+        transitionToStepReview(data.steps, data.message);
+      }
+    });
+  }
+
+  // Transition UI from questions phase to step review phase
+  function transitionToStepReview(steps, message) {
+    // Store full step objects (with fallbackSelectors, textContent, etc.)
+    currentReproSteps = steps.slice();
+
+    // Collapse questions
+    var questionsSection = document.getElementById('repro-phase-questions');
+    if (questionsSection) {
+      questionsSection.style.display = 'none';
+    }
+
+    // Show step review
+    var reviewSection = document.getElementById('repro-phase-review');
+    if (reviewSection) {
+      reviewSection.style.display = '';
+
+      // Update step cards
+      var cardsContainer = document.getElementById('repro-step-cards');
+      if (cardsContainer) {
+        cardsContainer.innerHTML = buildStepCards(steps);
+        wireStepCardEvents();
+      }
+
+      // Scroll into view
+      reviewSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }
+
+  // Wire events for step card edit/delete/save/cancel
+  function wireStepCardEvents() {
+    // Edit toggle
+    document.querySelectorAll('.repro-step-edit-toggle').forEach(function (btn) {
+      btn.onclick = function () {
+        var idx = btn.getAttribute('data-idx');
+        var editPanel = document.getElementById('repro-step-edit-' + idx);
+        if (editPanel) editPanel.style.display = editPanel.style.display === 'none' ? '' : 'none';
+      };
+    });
+    // Delete
+    document.querySelectorAll('.repro-step-delete').forEach(function (btn) {
+      btn.onclick = function () {
+        var card = btn.closest('.repro-step-card');
+        if (card && confirm('Remove this step?')) {
+          card.remove();
+          renumberStepCards();
+        }
+      };
+    });
+    // Save edit
+    document.querySelectorAll('.repro-step-save').forEach(function (btn) {
+      btn.onclick = function () {
+        var idx = parseInt(btn.getAttribute('data-idx'), 10);
+        var editPanel = document.getElementById('repro-step-edit-' + idx);
+        var card = btn.closest('.repro-step-card');
+        if (!editPanel || !card) return;
+        var fields = editPanel.querySelectorAll('.repro-edit-field');
+        var newData = {};
+        fields.forEach(function (f) { newData[f.getAttribute('data-field')] = f.value; });
+        // Update card display
+        var actionEl = card.querySelector('.repro-step-action');
+        var selectorEl = card.querySelector('.repro-step-selector');
+        var descEl = card.querySelector('.repro-step-desc');
+        if (actionEl) actionEl.textContent = newData.action || '';
+        if (selectorEl) selectorEl.textContent = newData.selector || '';
+        if (descEl) descEl.textContent = newData.description || '';
+        // Update chips
+        var chipsContainer = card.querySelector('.repro-step-chips');
+        if (chipsContainer) {
+          var newChips = [];
+          if (newData.text) newChips.push('text: "' + newData.text + '"');
+          if (newData.attribute) newChips.push('attr: ' + newData.attribute);
+          if (newData.expected) newChips.push('expected: "' + newData.expected + '"');
+          chipsContainer.innerHTML = newChips.map(function (c) { return '<span class="repro-step-chip">' + esc(c) + '</span>'; }).join('');
+        }
+        editPanel.style.display = 'none';
+      };
+    });
+    // Cancel edit
+    document.querySelectorAll('.repro-step-cancel').forEach(function (btn) {
+      btn.onclick = function () {
+        var idx = btn.getAttribute('data-idx');
+        var editPanel = document.getElementById('repro-step-edit-' + idx);
+        if (editPanel) editPanel.style.display = 'none';
+      };
+    });
+  }
+
+  // Renumber step cards after deletion
+  function renumberStepCards() {
+    var cards = document.querySelectorAll('.repro-step-card');
+    cards.forEach(function (card, idx) {
+      var numEl = card.querySelector('.repro-step-num');
+      if (numEl) numEl.textContent = (idx + 1);
+      card.setAttribute('data-step-idx', idx);
+    });
+  }
+
+  // Send refinement feedback to AI
+  function refineReproSteps() {
+    if (!currentBugId) return;
+    var input = document.getElementById('repro-refine-input');
+    var feedback = input ? input.value.trim() : '';
+    if (!feedback) {
+      alert('Type your feedback for the AI before clicking Refine.');
+      return;
+    }
+
+    var currentSteps = collectStepsFromCards();
+    var refineBtn = document.getElementById('repro-refine-btn');
+    if (refineBtn) { refineBtn.disabled = true; refineBtn.innerHTML = '<span class="spinner"></span> Refining\u2026'; }
+
+    apiPost('/api/bugs/' + currentBugId + '/repro-refine', { steps: currentSteps, feedback: feedback }, function (status, data) {
+      if (refineBtn) { refineBtn.disabled = false; refineBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg> Refine'; }
+      if (input) input.value = '';
+
+      if (status !== 200 || !data) {
+        alert('Refinement failed: ' + ((data && data.error) || 'Unknown error'));
+        return;
+      }
+
+      if (data.steps && data.steps.length > 0) {
+        // Update stored steps with the refined version
+        currentReproSteps = data.steps.slice();
+        var cardsContainer = document.getElementById('repro-step-cards');
+        if (cardsContainer) {
+          cardsContainer.innerHTML = buildStepCards(data.steps);
+          wireStepCardEvents();
+        }
+      }
+    });
+  }
+
+  // Run reproduction with current steps
+  function runReproduction() {
+    if (!currentBugId) return;
+    var steps = collectStepsFromCards();
+    if (steps.length === 0) {
+      alert('No steps to run. Add or generate steps first.');
+      return;
+    }
+
+    var runBtn = document.getElementById('repro-run-btn');
+    if (runBtn) { runBtn.disabled = true; runBtn.innerHTML = '<span class="spinner"></span> Running Reproduction\u2026'; }
+
+    apiPost('/api/bugs/' + currentBugId + '/repro-run', { steps: steps }, function (status, data) {
+      if (runBtn) { runBtn.disabled = false; runBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run Reproduction'; }
+
+      if (status !== 200 || !data) {
+        alert('Reproduction failed: ' + ((data && data.error) || 'Unknown error'));
+        return;
+      }
+
+      if (data.reproduction) {
+        // Rebuild full accordions with the reproduction result
+        var lastData = {
+          bug: document.querySelector('.fix-bug-title') ? { title: document.querySelector('.fix-bug-title').textContent } : {},
+          reproduction: data.reproduction,
+          reproSteps: steps,
+          reproMessage: data.reproduction.bugConfirmed ? 'Bug confirmed!' : 'Reproduction completed.',
+          analysis: currentAnalysis,
+          prompt: currentDiffPrompt,
+          bugImages: 0,
+          analysisCached: true
+        };
+        buildAnalysisAccordions(lastData, currentAnalysis);
+      }
     });
   }
 
@@ -1183,6 +1679,44 @@
         reproBody += '<pre class="repro-output">' + esc(repro.output) + '</pre>';
         reproBody += '</details>';
       }
+
+      // Per-step results (self-healing diagnostics)
+      if (repro.stepResults && repro.stepResults.length > 0) {
+        reproBody += '<details class="repro-output-details"><summary>\uD83D\uDCCA Step-by-Step Results (' + repro.stepResults.length + ' steps)</summary>';
+        reproBody += '<div class="repro-step-results">';
+        for (var sri = 0; sri < repro.stepResults.length; sri++) {
+          var sr = repro.stepResults[sri];
+          var srIcon = sr.status === 'ok' || sr.status === 'matched' ? '\u2705' :
+                       sr.status === 'not-found' ? '\u274c' :
+                       sr.status === 'error' ? '\u26a0\ufe0f' :
+                       sr.status === 'not-matched' ? '\uD83D\uDFE1' : '\u2022';
+          reproBody += '<div class="repro-step-result-item">';
+          reproBody += '<span class="repro-step-result-icon">' + srIcon + '</span>';
+          reproBody += '<span class="repro-step-result-num">Step ' + sr.step + '</span>';
+          reproBody += '<span class="repro-step-result-action">' + esc(sr.action) + '</span>';
+          reproBody += '<span class="repro-step-result-status repro-sr-' + sr.status + '">' + esc(sr.status) + '</span>';
+          if (sr.usedSelector && sr.method !== 'primary') {
+            reproBody += '<span class="repro-step-result-healed">\uD83D\uDD04 ' + esc(sr.usedSelector) + ' (via ' + esc(sr.method) + ')</span>';
+          }
+          if (sr.error) {
+            reproBody += '<span class="repro-step-result-error">' + esc(sr.error) + '</span>';
+          }
+          reproBody += '</div>';
+        }
+        reproBody += '</div></details>';
+      }
+
+      // DOM Snapshot (diagnostics)
+      if (repro.domSnapshot) {
+        var snap = repro.domSnapshot;
+        reproBody += '<details class="repro-output-details"><summary>\uD83D\uDD0D DOM Snapshot (' + (snap.buttons || []).length + ' btns, ' + (snap.inputs || []).length + ' inputs, ' + (snap.links || []).length + ' links)</summary>';
+        reproBody += '<pre class="repro-output">';
+        reproBody += 'BUTTONS:\n' + (snap.buttons || []).map(function (b, i) { return '  ' + (i+1) + '. ' + (b.text || '(no text)') + ' class="' + (b.class || '') + '" id="' + (b.id || '') + '"'; }).join('\n');
+        reproBody += '\n\nINPUTS:\n' + (snap.inputs || []).map(function (inp, i) { return '  ' + (i+1) + '. type=' + (inp.type || '?') + ' name="' + (inp.name || '') + '" placeholder="' + (inp.placeholder || '') + '" class="' + (inp.class || '') + '"'; }).join('\n');
+        reproBody += '\n\nSELECTS:\n' + (snap.selects || []).map(function (s, i) { return '  ' + (i+1) + '. name="' + (s.name || '') + '" class="' + (s.class || '') + '" options=' + (s.options || []).join(', '); }).join('\n');
+        reproBody += '</pre></details>';
+      }
+
       reproBody += '</div>';
 
       var reproBadge, reproBadgeColor;
@@ -1207,6 +1741,185 @@
         reproBadgeColor = '';
       }
       html += makeAccordion('repro', '\uD83C\uDFAD', 'Reproduction', reproBadge, reproBody, { open: true, badgeColor: reproBadgeColor });
+    }
+
+    // ── 1.7 Reproduction Plan — Multi-Phase Interactive Panel ──
+    if (data.reproPlan) {
+      var rp = data.reproPlan;
+      var hasQs = rp.questions && rp.questions.length > 0;
+      var rpBody = '<div class="acc-body-inner repro-plan-body">';
+
+      // Confidence indicator
+      var confColor = rp.confidence === 'high' ? '#22c55e' : (rp.confidence === 'medium' ? '#eab308' : '#ef4444');
+      var confLabel = rp.confidence === 'high' ? 'High' : (rp.confidence === 'medium' ? 'Medium' : 'Low');
+      rpBody += '<div class="repro-plan-confidence">';
+      rpBody += '<span class="repro-conf-dot" style="background:' + confColor + '"></span>';
+      rpBody += 'AI Confidence: <strong>' + confLabel + '</strong>';
+      rpBody += ' \u00B7 ' + (rp.stepsCount || 0) + ' steps generated';
+      rpBody += '</div>';
+
+      // Plan summary
+      if (rp.plan && rp.plan.length > 0) {
+        rpBody += '<div class="repro-plan-steps">';
+        rpBody += '<div class="repro-plan-label">Reproduction Plan:</div>';
+        rpBody += '<ol class="repro-plan-list">';
+        for (var pi = 0; pi < rp.plan.length; pi++) {
+          rpBody += '<li>' + esc(rp.plan[pi]) + '</li>';
+        }
+        rpBody += '</ol></div>';
+      }
+
+      // Form Analysis (if AI detected forms)
+      if (rp.formAnalysis && rp.formAnalysis.hasForms && rp.formAnalysis.fields && rp.formAnalysis.fields.length > 0) {
+        rpBody += '<details class="repro-form-analysis" open>';
+        rpBody += '<summary>\uD83D\uDCDD Form Analysis (' + rp.formAnalysis.fields.length + ' fields detected)</summary>';
+        rpBody += '<div class="repro-form-fields">';
+        rpBody += '<table class="repro-form-table"><thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Test Value</th><th>Selector</th></tr></thead><tbody>';
+        for (var fi = 0; fi < rp.formAnalysis.fields.length; fi++) {
+          var f = rp.formAnalysis.fields[fi];
+          var reqBadge = f.required ? '<span class="repro-req-badge">Required</span>' : '<span class="repro-opt-badge">Optional</span>';
+          rpBody += '<tr>';
+          rpBody += '<td>' + esc(f.name || '') + '</td>';
+          rpBody += '<td>' + esc(f.type || 'text') + '</td>';
+          rpBody += '<td>' + reqBadge + '</td>';
+          rpBody += '<td><code>' + esc(f.testValue || '') + '</code></td>';
+          rpBody += '<td><code>' + esc(f.selector || '') + '</code></td>';
+          rpBody += '</tr>';
+        }
+        rpBody += '</tbody></table>';
+        if (rp.formAnalysis.submitSelector) {
+          rpBody += '<div class="repro-form-submit">Submit: <code>' + esc(rp.formAnalysis.submitSelector) + '</code>';
+          if (rp.formAnalysis.submitAction) rpBody += ' (action: ' + esc(rp.formAnalysis.submitAction) + ')';
+          rpBody += '</div>';
+        }
+        rpBody += '</div></details>';
+      }
+
+      // Questions from AI (Phase 1)
+      if (hasQs) {
+        rpBody += '<div class="repro-questions-section" id="repro-phase-questions">';
+        rpBody += '<div class="repro-phase-header"><span class="repro-phase-num">1</span> Answer AI Questions</div>';
+        rpBody += '<div class="repro-questions-label">\u2753 AI has ' + rp.questions.length + ' question' + (rp.questions.length > 1 ? 's' : '') + ' before generating final steps:</div>';
+        rpBody += '<div class="repro-questions-list" id="repro-questions-list">';
+        for (var rqi = 0; rqi < rp.questions.length; rqi++) {
+          var q = rp.questions[rqi];
+          rpBody += '<div class="repro-question-item" data-qid="' + esc(q.id || ('q' + rqi)) + '">';
+          rpBody += '<div class="repro-question-text">' + (rqi + 1) + '. ' + esc(q.question) + '</div>';
+          if (q.reason) rpBody += '<div class="repro-question-reason">' + esc(q.reason) + '</div>';
+          if (q.affectedSteps && q.affectedSteps.length > 0) {
+            rpBody += '<div class="repro-question-affected">Affects step' + (q.affectedSteps.length > 1 ? 's' : '') + ': ' + q.affectedSteps.join(', ') + '</div>';
+          }
+          if (q.options && q.options.length > 0) {
+            rpBody += '<div class="repro-question-options">';
+            for (var oi = 0; oi < q.options.length; oi++) {
+              rpBody += '<label class="repro-option-label">';
+              rpBody += '<input type="radio" name="repro-q-' + rqi + '" value="' + esc(q.options[oi]) + '"> ';
+              rpBody += esc(q.options[oi]);
+              rpBody += '</label>';
+            }
+            rpBody += '<label class="repro-option-label">';
+            rpBody += '<input type="radio" name="repro-q-' + rqi + '" value="__custom__" class="repro-custom-radio"> ';
+            rpBody += 'Other: <input type="text" class="repro-custom-input" placeholder="Type your answer..." data-qidx="' + rqi + '">';
+            rpBody += '</label>';
+            rpBody += '</div>';
+          } else {
+            rpBody += '<div class="repro-question-freetext">';
+            rpBody += '<input type="text" class="repro-answer-input" placeholder="Type your answer..." data-qidx="' + rqi + '">';
+            rpBody += '</div>';
+          }
+          rpBody += '</div>';
+        }
+        rpBody += '</div>'; // end questions-list
+
+        // Phase 1 action buttons
+        rpBody += '<div class="repro-plan-actions">';
+        rpBody += '<button class="btn btn-primary btn-sm" id="repro-answer-submit-btn">';
+        rpBody += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg> Submit Answers & Generate Steps</button>';
+        rpBody += '<button class="btn btn-outline btn-sm" id="repro-skip-run-btn">';
+        rpBody += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Skip & Show Steps</button>';
+        rpBody += '</div>';
+        rpBody += '</div>'; // end Phase 1 questions section
+      } else {
+        // No questions — show steps directly for review
+        rpBody += '<div class="repro-questions-section">';
+        rpBody += '<div class="repro-questions-label" style="color: var(--success);">\u2705 AI is confident. Review the steps below.</div>';
+        rpBody += '</div>';
+      }
+
+      // Uncertain selectors (informational)
+      if (rp.uncertainSelectors && rp.uncertainSelectors.length > 0) {
+        rpBody += '<details class="repro-uncertain-details"><summary>\u26a0\ufe0f ' + rp.uncertainSelectors.length + ' uncertain selector(s)</summary>';
+        rpBody += '<div class="repro-uncertain-list">';
+        for (var usi = 0; usi < rp.uncertainSelectors.length; usi++) {
+          var us = rp.uncertainSelectors[usi];
+          rpBody += '<div class="repro-uncertain-item">';
+          rpBody += '<code>' + esc(us.selector) + '</code>: ' + esc(us.reason || '');
+          if (us.alternatives && us.alternatives.length > 0) {
+            rpBody += ' <span class="repro-alts">Alternatives: ' + us.alternatives.map(function (a) { return '<code>' + esc(a) + '</code>'; }).join(', ') + '</span>';
+          }
+          rpBody += '</div>';
+        }
+        rpBody += '</div></details>';
+      }
+
+      // Phase 2: Step Review (shown inline if no questions or after answering)
+      // Build step cards — always present but hidden if questions exist
+      var stepsDisplay = hasQs ? ' style="display:none;"' : '';
+      rpBody += '<div class="repro-step-review" id="repro-phase-review"' + stepsDisplay + '>';
+      rpBody += '<div class="repro-phase-header"><span class="repro-phase-num">' + (hasQs ? '2' : '1') + '</span> Review & Edit Steps</div>';
+      rpBody += '<div class="repro-step-cards" id="repro-step-cards">';
+      if (rp.steps && rp.steps.length > 0) {
+        rpBody += buildStepCards(rp.steps);
+      }
+      rpBody += '</div>'; // end step-cards
+
+      // Phase 3: Refinement feedback
+      rpBody += '<div class="repro-refine-section">';
+      rpBody += '<div class="repro-refine-input-row">';
+      rpBody += '<input type="text" class="repro-refine-input" id="repro-refine-input" placeholder="Tell AI what to change: e.g. \'Add a step to fill the email field\', \'Change selector on step 3 to .my-class\'...">';
+      rpBody += '<button class="btn btn-outline btn-sm" id="repro-refine-btn">';
+      rpBody += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg> Refine</button>';
+      rpBody += '</div>';
+      rpBody += '</div>';
+
+      // Phase 4: Run button
+      rpBody += '<div class="repro-run-actions">';
+      rpBody += '<button class="btn btn-primary" id="repro-run-btn">';
+      rpBody += '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run Reproduction</button>';
+      rpBody += '<span class="repro-run-hint">Steps will be executed in a real browser via Puppeteer</span>';
+      rpBody += '</div>';
+      rpBody += '</div>'; // end step-review
+
+      rpBody += '</div>'; // end acc-body-inner
+
+      var rpBadge = hasQs ? (rp.questions.length + ' question' + (rp.questions.length > 1 ? 's' : '')) : (rp.stepsCount + ' steps');
+      var rpBadgeColor = hasQs ? 'orange' : 'blue';
+      html += makeAccordion('repro-plan', '\uD83D\uDCCB', 'Reproduction Plan', rpBadge, rpBody, { open: true, badgeColor: rpBadgeColor });
+    }
+
+    // ── 1.8 Step Review panel (shown after /repro-answer returns) ──
+    if (data.reproSteps && data.reproSteps.length > 0 && !data.reproPlan) {
+      var srBody = '<div class="acc-body-inner repro-plan-body">';
+      srBody += '<div class="repro-phase-header"><span class="repro-phase-num">\u2705</span> Review & Edit Steps</div>';
+      if (data.reproMessage) {
+        srBody += '<div class="repro-refine-message">' + esc(data.reproMessage) + '</div>';
+      }
+      srBody += '<div class="repro-step-cards" id="repro-step-cards">';
+      srBody += buildStepCards(data.reproSteps);
+      srBody += '</div>';
+      srBody += '<div class="repro-refine-section">';
+      srBody += '<div class="repro-refine-input-row">';
+      srBody += '<input type="text" class="repro-refine-input" id="repro-refine-input" placeholder="Tell AI what to change...">';
+      srBody += '<button class="btn btn-outline btn-sm" id="repro-refine-btn">';
+      srBody += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg> Refine</button>';
+      srBody += '</div></div>';
+      srBody += '<div class="repro-run-actions">';
+      srBody += '<button class="btn btn-primary" id="repro-run-btn">';
+      srBody += '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run Reproduction</button>';
+      srBody += '<span class="repro-run-hint">Steps will be executed in a real browser via Puppeteer</span>';
+      srBody += '</div>';
+      srBody += '</div>';
+      html += makeAccordion('repro-review', '\uD83D\uDD0D', 'Step Review', data.reproSteps.length + ' steps', srBody, { open: true, badgeColor: 'blue' });
     }
 
     // ── 2. AI Analysis accordion (open by default) ──
@@ -1325,6 +2038,35 @@
     // Wire verify fix button
     var verifyBtn = document.getElementById('verify-fix-btn');
     if (verifyBtn) verifyBtn.addEventListener('click', verifyFix);
+
+    // Wire reproduction plan answer/skip buttons
+    var reproAnswerBtn = document.getElementById('repro-answer-submit-btn');
+    var reproSkipBtn = document.getElementById('repro-skip-run-btn');
+    if (reproAnswerBtn) reproAnswerBtn.addEventListener('click', submitReproAnswers);
+    if (reproSkipBtn) reproSkipBtn.addEventListener('click', skipReproQuestions);
+
+    // Wire reproduction step review buttons (refine, run)
+    var reproRefineBtn = document.getElementById('repro-refine-btn');
+    var reproRunBtn = document.getElementById('repro-run-btn');
+    if (reproRefineBtn) reproRefineBtn.addEventListener('click', refineReproSteps);
+    if (reproRunBtn) reproRunBtn.addEventListener('click', runReproduction);
+
+    // Wire step card events if step cards are visible on initial render (no questions)
+    var stepCards = document.querySelectorAll('.repro-step-card');
+    if (stepCards.length > 0) {
+      // Store initial steps for self-healing field preservation
+      if (data.reproPlan && data.reproPlan.steps) currentReproSteps = data.reproPlan.steps.slice();
+      else if (data.reproSteps) currentReproSteps = data.reproSteps.slice();
+      wireStepCardEvents();
+    }
+
+    // Allow pressing Enter in refine input to trigger refinement
+    var reproRefineInput = document.getElementById('repro-refine-input');
+    if (reproRefineInput) {
+      reproRefineInput.addEventListener('keypress', function (e) {
+        if (e.key === 'Enter') refineReproSteps();
+      });
+    }
 
     // Hide the old file viewer section (regex results) — we only show AI diffs now
     fileViewerSection.style.display = 'none';
